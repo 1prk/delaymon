@@ -63,6 +63,18 @@
   #basemapToggle button{flex:1;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--panel2);
     color:var(--text);font-size:11px;cursor:pointer}
   #basemapToggle button.active{background:var(--accent);color:#08131f;border-color:var(--accent);font-weight:600}
+  #viewportRow{display:flex;flex-direction:column;gap:5px;padding:0 14px 12px}
+  #btnFetchStations{padding:7px 8px;border-radius:6px;border:1px solid var(--border);background:var(--panel2);
+    color:var(--text);font-size:11px;cursor:pointer}
+  #btnFetchStations:disabled{opacity:.5;cursor:default}
+  #viewportStatus{font-size:10px;color:var(--muted);min-height:12px}
+  #areaOverview{position:absolute;top:16px;left:16px;background:rgba(20,24,28,.92);border:1px solid var(--border);
+    border-radius:8px;padding:8px 12px;font-size:11px;z-index:600;color:var(--text);max-width:250px}
+  #areaOverview.hidden{display:none}
+  #areaOverview .overview-title{font-weight:700;margin-bottom:4px}
+  #areaOverview .overview-row{margin:2px 0;color:var(--muted)}
+  #areaOverview .overview-worst{cursor:pointer;color:var(--accent)}
+  .viewport-dot-wrap{background:transparent;border:none}
   #legend{position:absolute;top:16px;right:16px;background:rgba(20,24,28,.92);border:1px solid var(--border);
     border-radius:8px;padding:8px 12px;font-size:11px;z-index:600;color:var(--text);max-width:230px}
   #legend div{display:flex;align-items:center;gap:6px;margin:2px 0}
@@ -143,6 +155,10 @@
       <button id="btnDark" class="active">Carto Dark</button>
       <button id="btnLight">Carto Light</button>
     </div>
+    <div id="viewportRow">
+      <button id="btnFetchStations">Fetch stations in view</button>
+      <span id="viewportStatus"></span>
+    </div>
     <div id="error"></div>
     <div class="scroll" id="resultsPane">
       <div class="empty-hint">
@@ -154,6 +170,7 @@
   </div>
   <div id="mapArea">
     <div id="map"></div>
+    <div id="areaOverview" class="hidden"></div>
     <div id="legend">
       <div id="legendGradient">
         <div class="legend-bar"></div>
@@ -169,6 +186,7 @@
       <div style="margin-top:4px;color:var(--muted)">Pulsing dot = vehicle position (live GPS if reported, else interpolated)</div>
       <div style="margin-top:4px;color:var(--muted)">Use "Show from" in a stop's list to see past/departed trips</div>
       <div style="margin-top:4px;color:var(--muted)">"Ø +N min" badge = live delay index for the queried stop — click for details</div>
+      <div style="margin-top:4px;color:var(--muted)">"Fetch stations in view" colors every nearby stop by its own delay index</div>
     </div>
     <div id="pearlChain" class="hidden"></div>
   </div>
@@ -260,6 +278,23 @@ function stationBoard(loc, refDate) {
 
 function journeyDetails(jid) {
   return hafas('JourneyDetails', { jid, getPolyline: true });
+}
+
+// "Nearby stops" — the single-request method behind every HAFAS app's
+// "stations near me": a radius search from a center point, not a lookup
+// per station. maxLoc caps how many stops come back in that one request
+// (bounding worst case before we go on to fetch each one's own delay data).
+function locGeoPos(centerLatLng, maxDistMeters, maxLoc) {
+  return hafas('LocGeoPos', {
+    ring: {
+      cCrd: { x: Math.round(centerLatLng.lng * 1e6), y: Math.round(centerLatLng.lat * 1e6) },
+      maxDist: Math.round(maxDistMeters),
+      minDist: 0,
+    },
+    getPOIs: false,
+    getStops: true,
+    maxLoc,
+  });
 }
 
 /* --- time helpers ------------------------------------------------- */
@@ -417,6 +452,7 @@ function setBasemap(which) {
 }
 
 let routeLayer = L.layerGroup().addTo(map);
+let viewportLayer = L.layerGroup().addTo(map);
 let stationMarker = null;
 let stationIndexMarker = null;
 let stationIndexTimer = null;
@@ -618,6 +654,136 @@ function startStopIndexPolling(loc) {
     }
   }, 45000);
 }
+
+/* --- viewport station overview --------------------------------------- */
+//
+// "Fetch stations in view" is two different costs stacked together:
+// 1) LocGeoPos — one request, regardless of how many stops it returns.
+// 2) One StationBoard call PER stop, to compute each one's delay index
+//    (StationBoard only ever reports on one stop at a time — there's no
+//    bulk "delay index for all these stops" endpoint to call instead).
+// (2) is the one that can actually add load, so it's bounded two ways:
+// maxLoc caps how many stops LocGeoPos can hand us in the first place,
+// and the StationBoard calls run with a small concurrency cap rather
+// than firing all of them at once.
+const VIEWPORT_MAX_STOPS = 60;
+const VIEWPORT_CONCURRENCY = 4;
+
+async function fetchWithConcurrencyLimit(items, limit, worker, onProgress) {
+  const results = new Array(items.length);
+  let next = 0;
+  let done = 0;
+  async function run() {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await worker(items[i], i);
+      done++;
+      if (onProgress) onProgress(done, items.length);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, run));
+  return results;
+}
+
+async function fetchStationsInViewport() {
+  const btn = document.getElementById('btnFetchStations');
+  const status = document.getElementById('viewportStatus');
+  clearError();
+  viewportLayer.clearLayers();
+  document.getElementById('areaOverview').classList.add('hidden');
+  btn.disabled = true;
+  status.textContent = 'Finding stations in view…';
+
+  try {
+    const center = map.getCenter();
+    const radiusMeters = center.distanceTo(map.getBounds().getNorthEast());
+    const res = await locGeoPos(center, radiusMeters, VIEWPORT_MAX_STOPS);
+    // Shape not confirmed live for this install (network to INSA is
+    // blocked from the dev sandbox) — check both plausible locations for
+    // the returned list, matching how LocMatch's res.match.locL differs
+    // from other methods' res.common.locL.
+    const stops = ((res.locL) || (res.common && res.common.locL) || [])
+      .filter(l => l && l.crd && l.lid);
+
+    if (!stops.length) {
+      status.textContent = 'No stations found in this view.';
+      return;
+    }
+
+    status.textContent = `Loading delay data — 0/${stops.length}`;
+    const results = await fetchWithConcurrencyLimit(
+      stops,
+      VIEWPORT_CONCURRENCY,
+      async (stop) => {
+        try {
+          const boardRes = await stationBoard({ name: stop.name, lid: stop.lid });
+          return { stop, index: computeStopDelayIndex(boardRes.jnyL || []) };
+        } catch (e) {
+          return { stop, index: null };
+        }
+      },
+      (done, total) => { status.textContent = `Loading delay data — ${done}/${total}`; }
+    );
+
+    renderViewportStations(results);
+    status.textContent = `${stops.length} station(s) loaded`;
+  } catch (e) {
+    status.textContent = '';
+    handleFetchError(e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderViewportStations(results) {
+  results.forEach(r => {
+    if (!r || !r.stop.crd) return;
+    const latlng = [r.stop.crd.y / 1e6, r.stop.crd.x / 1e6];
+    const avg = r.index ? r.index.avg : null;
+    const color = avg === null ? '#6b7280' : delayColor(avg);
+    const label = avg === null ? 'no data' : `Ø ${avg <= 0 ? '0' : '+' + avg.toFixed(1)} min`;
+    const cancelledTxt = r.index && r.index.cancelledCount ? `<br>${r.index.cancelledCount} cancelled` : '';
+    const marker = L.circleMarker(latlng, {
+      radius: 7, weight: 1.5, color: '#14171a', fillColor: color, fillOpacity: .9,
+    }).bindTooltip(`<b>${r.stop.name}</b><br>${label}${cancelledTxt}`, { direction: 'top' });
+    marker.on('click', () => showStationBoardFor(r.stop));
+    marker.addTo(viewportLayer);
+  });
+  renderAreaOverview(results);
+}
+
+function computeAreaOverview(results) {
+  const withData = results.filter(r => r && r.index && r.index.avg !== null);
+  const avgOfAvgs = withData.length ? withData.reduce((s, r) => s + r.index.avg, 0) / withData.length : null;
+  const totalCancelled = results.reduce((s, r) => s + (r && r.index ? r.index.cancelledCount : 0), 0);
+  const worst = withData.reduce((best, r) => (!best || r.index.avg > best.index.avg ? r : best), null);
+  return { avgOfAvgs, totalCancelled, worst, stationCount: results.length, dataCount: withData.length };
+}
+
+function renderAreaOverview(results) {
+  const el = document.getElementById('areaOverview');
+  const ov = computeAreaOverview(results);
+  const avgTxt = ov.avgOfAvgs === null ? 'n/a' : `${ov.avgOfAvgs <= 0 ? '0' : '+' + ov.avgOfAvgs.toFixed(1)} min`;
+  const worstTxt = ov.worst
+    ? `<span class="overview-worst" id="overviewWorstBtn">${ov.worst.stop.name} (${ov.worst.index.avg <= 0 ? '0' : '+' + ov.worst.index.avg.toFixed(1)} min)</span>`
+    : 'n/a';
+  el.innerHTML = `
+    <div class="overview-title">Viewport delay overview</div>
+    <div class="overview-row">${ov.stationCount} station(s), ${ov.dataCount} with live data</div>
+    <div class="overview-row">area average: <b style="color:var(--text)">${avgTxt}</b></div>
+    <div class="overview-row">worst stop: ${worstTxt}</div>
+    <div class="overview-row">${ov.totalCancelled} cancellation(s) across all stops</div>`;
+  el.classList.remove('hidden');
+  if (ov.worst) {
+    document.getElementById('overviewWorstBtn').addEventListener('click', () => {
+      const latlng = [ov.worst.stop.crd.y / 1e6, ov.worst.stop.crd.x / 1e6];
+      map.setView(latlng, 16);
+      showStationBoardFor(ov.worst.stop);
+    });
+  }
+}
+
+document.getElementById('btnFetchStations').addEventListener('click', fetchStationsInViewport);
 
 async function selectStation(loc, itemEl) {
   document.querySelectorAll('#resultsPane .list-item').forEach(el => el.classList.remove('active'));
