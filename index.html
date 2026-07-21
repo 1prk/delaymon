@@ -58,6 +58,14 @@
   .delay-label-wrap{background:transparent;border:none}
   .delay-label{padding:1px 6px;border-radius:8px;font-size:10px;font-weight:700;color:#0b0e10;text-align:center;
     white-space:nowrap;box-shadow:0 1px 3px rgba(0,0,0,.5);font-family:sans-serif}
+  .vehicle-marker-wrap{background:transparent;border:none}
+  .vehicle-marker{width:16px;height:16px;border-radius:50%;border:3px solid #fff;
+    animation:vehiclePulse 1.6s ease-in-out infinite}
+  .leaflet-marker-icon.vehicle-marker-wrap{transition:transform 1.8s linear}
+  @keyframes vehiclePulse{
+    0%,100%{box-shadow:0 0 0 4px rgba(255,255,255,.28)}
+    50%{box-shadow:0 0 0 9px rgba(255,255,255,.08)}
+  }
   ::-webkit-scrollbar{width:8px}
   ::-webkit-scrollbar-thumb{background:#333a42;border-radius:4px}
   .empty-hint{padding:14px;color:var(--muted);font-size:12px;line-height:1.5}
@@ -96,6 +104,7 @@
   <div><span class="swatch" style="background:#e5484d"></span> &gt;10 min late</div>
   <div><span class="swatch" style="background:#6b7280"></span> no realtime data</div>
   <div style="margin-top:4px;color:var(--muted)">Click a stop's <b>H</b> marker for its other lines</div>
+  <div style="margin-top:4px;color:var(--muted)">Pulsing dot = approximate vehicle position (interpolated, not GPS)</div>
 </div>
 
 <script>
@@ -268,6 +277,13 @@ function setBasemap(which) {
 
 let routeLayer = L.layerGroup().addTo(map);
 let stationMarker = null;
+let vehicleMarker = null;
+let vehicleTimer = null;
+
+function stopVehicleTracking() {
+  if (vehicleTimer) { clearInterval(vehicleTimer); vehicleTimer = null; }
+  vehicleMarker = null; // owned by routeLayer; cleared along with it
+}
 
 /* --- UI plumbing ----------------------------------------------------- */
 
@@ -342,6 +358,7 @@ async function selectStation(loc, itemEl) {
   if (itemEl) itemEl.classList.add('active');
   clearError();
   routeLayer.clearLayers();
+  stopVehicleTracking();
 
   if (loc.crd) {
     const latlng = [loc.crd.y / 1e6, loc.crd.x / 1e6];
@@ -422,12 +439,22 @@ async function selectJourney(jny, itemEl) {
   if (itemEl) itemEl.classList.add('active');
   clearError();
   routeLayer.clearLayers();
+  stopVehicleTracking();
   try {
     const res = await journeyDetails(jny.jid);
     drawJourney(res);
   } catch (e) {
     handleFetchError(e);
   }
+}
+
+function vehicleIcon(color) {
+  return L.divIcon({
+    className: 'vehicle-marker-wrap',
+    html: `<div class="vehicle-marker" style="background:${color}"></div>`,
+    iconSize: [16, 16],
+    iconAnchor: [8, 8],
+  });
 }
 
 function hIcon(color) {
@@ -471,6 +498,82 @@ function matchStopsToPolyline(coords, points) {
   return idxs;
 }
 
+// HAFAS times are "HHMMSS" strings that may run past 24:00:00 to denote
+// the next calendar day without changing the date field (e.g. "250000" =
+// 01:00 the day after `dateStr`). dateStr is "YYYYMMDD"; falls back to
+// today if absent, which is the best we can do without a confirmed date
+// field on every stop.
+function parseHafasDateTime(dateStr, timeStr) {
+  if (!timeStr) return null;
+  const s = timeStr.padStart(6, '0');
+  let h = parseInt(s.slice(0, 2), 10);
+  const m = parseInt(s.slice(2, 4), 10);
+  const sec = parseInt(s.slice(4, 6), 10);
+  const dayOverflow = Math.floor(h / 24);
+  h = h % 24;
+  const now = new Date();
+  let year = now.getFullYear(), month = now.getMonth(), day = now.getDate();
+  if (dateStr && dateStr.length === 8) {
+    year = parseInt(dateStr.slice(0, 4), 10);
+    month = parseInt(dateStr.slice(4, 6), 10) - 1;
+    day = parseInt(dateStr.slice(6, 8), 10);
+  }
+  const dt = new Date(year, month, day, h, m, sec);
+  dt.setDate(dt.getDate() + dayOverflow);
+  return dt;
+}
+
+// Prefers the realtime time/date over scheduled, per HAFAS convention.
+function stopDateTime(stop, kind) {
+  const timeStr = stop[`${kind}TimeR`] || stop[`${kind}TimeS`];
+  const dateStr = stop[`${kind}DateR`] || stop[`${kind}DateS`];
+  return parseHafasDateTime(dateStr, timeStr);
+}
+
+// Interpolates a lat/lng at `frac` (0..1) along a coordinate list, treating
+// vertices as evenly spaced — an approximation, but a reasonable one for a
+// short stop-to-stop leg.
+function pointAtFraction(coords, frac) {
+  if (!coords || !coords.length) return null;
+  if (coords.length === 1) return coords[0];
+  const scaled = Math.max(0, Math.min(1, frac)) * (coords.length - 1);
+  const i0 = Math.floor(scaled);
+  const i1 = Math.min(i0 + 1, coords.length - 1);
+  const t = scaled - i0;
+  const a = coords[i0], b = coords[i1];
+  return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+}
+
+// Approximates the vehicle's current position: this is NOT live GPS (this
+// HAFAS endpoint doesn't expose one that we could confirm), it's a
+// schedule interpolation — for whichever stop-to-stop leg `now` falls
+// into, position = that fraction of elapsed/total time, mapped onto the
+// same route-geometry segment used for the delay coloring.
+function computeVehiclePosition(points, segCoordsList) {
+  const now = new Date();
+  if (!points.length) return null;
+
+  const firstDep = stopDateTime(points[0].stop, 'd');
+  if (firstDep && now < firstDep) return null; // hasn't departed yet
+
+  for (let i = 0; i < points.length - 1; i++) {
+    const dep = stopDateTime(points[i].stop, 'd');
+    const arr = stopDateTime(points[i + 1].stop, 'a');
+    if (!dep || !arr || arr <= dep) continue;
+    if (now >= dep && now <= arr) {
+      const frac = (now - dep) / (arr - dep);
+      const latlng = pointAtFraction(segCoordsList[i], frac);
+      const delay = points[i + 1].delay !== null ? points[i + 1].delay : points[i].delay;
+      return { latlng, delay };
+    }
+    if (now < dep) {
+      // between arrival at stop i and departure — dwelling at the stop
+      return { latlng: points[i].latlng, delay: points[i].delay };
+    }
+  }
+  return null; // before start or after the last stop
+}
+
 function drawJourney(res) {
   const locL = (res.common && res.common.locL) || [];
   const polyL = (res.common && res.common.polyL) || [];
@@ -506,6 +609,9 @@ function drawJourney(res) {
 
   // Delay-colored segments, snapped to the real route geometry between
   // each pair of consecutive stops, with a "+N min" label at the midpoint.
+  // segCoordsList is kept around so the vehicle interpolation below walks
+  // the same geometry the coloring uses.
+  const segCoordsList = [];
   for (let i = 0; i < points.length - 1; i++) {
     const a = points[i], b = points[i + 1];
     const segDelay = b.delay !== null ? b.delay : a.delay;
@@ -515,6 +621,7 @@ function drawJourney(res) {
     } else {
       segCoords = [a.latlng, b.latlng];
     }
+    segCoordsList.push(segCoords);
     L.polyline(segCoords, { color: delayColor(segDelay), weight: 6, opacity: .9 }).addTo(routeLayer);
 
     const mid = segCoords[Math.floor(segCoords.length / 2)];
@@ -539,6 +646,32 @@ function drawJourney(res) {
     const bounds = L.latLngBounds(points.map(p => p.latlng));
     map.fitBounds(bounds, { padding: [40, 40] });
   }
+
+  startVehicleTracking(points, segCoordsList);
+}
+
+// Ticks the interpolated vehicle marker forward every 2s. Not live GPS —
+// see computeVehiclePosition's comment — but a smoothly-updating best
+// guess of where the vehicle is right now, given schedule + delay.
+function startVehicleTracking(points, segCoordsList) {
+  stopVehicleTracking();
+  const tick = () => {
+    const pos = computeVehiclePosition(points, segCoordsList);
+    if (!pos) {
+      if (vehicleMarker) { routeLayer.removeLayer(vehicleMarker); vehicleMarker = null; }
+      return;
+    }
+    if (!vehicleMarker) {
+      vehicleMarker = L.marker(pos.latlng, { icon: vehicleIcon(delayColor(pos.delay)), zIndexOffset: 1000 })
+        .bindTooltip('approximate position (interpolated from timetable + delay, not live GPS)', { direction: 'top' })
+        .addTo(routeLayer);
+    } else {
+      vehicleMarker.setLatLng(pos.latlng);
+      vehicleMarker.setIcon(vehicleIcon(delayColor(pos.delay)));
+    }
+  };
+  tick();
+  vehicleTimer = setInterval(tick, 2000);
 }
 </script>
 </body>
