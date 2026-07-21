@@ -126,11 +126,19 @@ async function hafas(meth, req) {
     formatted: false,
     svcReqL: [{ meth, req, id: '1|1|' }],
   };
+  // Content-Type is deliberately text/plain, not application/json: a
+  // non-"simple" Content-Type forces a CORS preflight (OPTIONS), and
+  // INSA's mgate.exe answers preflights without Access-Control-Allow-
+  // Methods/-Headers, so the browser blocks the real request before it's
+  // even sent. text/plain keeps this a "simple request" (no preflight),
+  // and the actual POST response does carry Access-Control-Allow-Origin:
+  // *, so it succeeds. The server parses the body as JSON regardless of
+  // the declared content type.
   const res = await fetch(`${HAFAS_ENDPOINT}?rnd=${Date.now()}`, {
     method: 'POST',
     mode: 'cors',
     credentials: 'omit',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'text/plain' },
     body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status} from HAFAS endpoint`);
@@ -293,10 +301,9 @@ async function runSearch(q) {
 
 function handleFetchError(e) {
   const corsHint = (e instanceof TypeError)
-    ? '\n\nThis usually means the browser blocked the cross-origin request (CORS). ' +
-      'The INSA endpoint may only allow requests from its own site. If this ' +
-      'keeps happening, this page needs a small same-origin proxy in front of ' +
-      'reiseauskunft.insa.de.'
+    ? '\n\nThis usually means the browser blocked the cross-origin request (CORS) — ' +
+      'check the Network tab for the OPTIONS preflight response and whether it ' +
+      'includes Access-Control-Allow-Methods/-Headers.'
     : '';
   showError(`Request failed: ${e.message}${corsHint}`);
   console.error(e);
