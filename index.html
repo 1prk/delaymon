@@ -74,7 +74,9 @@
   #areaOverview .overview-title{font-weight:700;margin-bottom:4px}
   #areaOverview .overview-row{margin:2px 0;color:var(--muted)}
   #areaOverview .overview-worst{cursor:pointer;color:var(--accent)}
-  .viewport-dot-wrap{background:transparent;border:none}
+  .leaflet-tooltip.viewport-label{background:rgba(20,24,28,.92);color:var(--text);border:1px solid var(--border);
+    border-radius:6px;padding:2px 6px;font-size:10px;box-shadow:none;white-space:nowrap}
+  .leaflet-tooltip.viewport-label::before{display:none}
   #legend{position:absolute;top:16px;right:16px;background:rgba(20,24,28,.92);border:1px solid var(--border);
     border-radius:8px;padding:8px 12px;font-size:11px;z-index:600;color:var(--text);max-width:230px}
   #legend div{display:flex;align-items:center;gap:6px;margin:2px 0}
@@ -668,6 +670,7 @@ function startStopIndexPolling(loc) {
 // than firing all of them at once.
 const VIEWPORT_MAX_STOPS = 60;
 const VIEWPORT_CONCURRENCY = 4;
+const VIEWPORT_LOOKBACK_MIN = 60;
 
 async function fetchWithConcurrencyLimit(items, limit, worker, onProgress) {
   const results = new Array(items.length);
@@ -710,13 +713,19 @@ async function fetchStationsInViewport() {
       return;
     }
 
-    status.textContent = `Loading delay data — 0/${stops.length}`;
+    // A 1-hour lookback per stop (same mechanism as a single stop's "Show
+    // from" selector) instead of "now": low-frequency stops can have very
+    // few upcoming departures to average over, so pulling in the last
+    // hour's already-departed runs too gives a sturdier index — comparing
+    // stops on 1 upcoming tram vs. another's 8 is not a fair comparison.
+    const refDate = new Date(Date.now() - VIEWPORT_LOOKBACK_MIN * 60000);
+    status.textContent = `Loading delay data (last ${VIEWPORT_LOOKBACK_MIN} min) — 0/${stops.length}`;
     const results = await fetchWithConcurrencyLimit(
       stops,
       VIEWPORT_CONCURRENCY,
       async (stop) => {
         try {
-          const boardRes = await stationBoard({ name: stop.name, lid: stop.lid });
+          const boardRes = await stationBoard({ name: stop.name, lid: stop.lid }, refDate);
           return { stop, index: computeStopDelayIndex(boardRes.jnyL || []) };
         } catch (e) {
           return { stop, index: null };
@@ -736,16 +745,22 @@ async function fetchStationsInViewport() {
 }
 
 function renderViewportStations(results) {
+  // Labels are permanently open (not hover-only) so every stop's delay is
+  // readable at a glance across the whole viewport — the point of this
+  // view is comparing many stops at once to spot the worst performer,
+  // which a hover-one-at-a-time tooltip defeats.
   results.forEach(r => {
     if (!r || !r.stop.crd) return;
     const latlng = [r.stop.crd.y / 1e6, r.stop.crd.x / 1e6];
     const avg = r.index ? r.index.avg : null;
     const color = avg === null ? '#6b7280' : delayColor(avg);
-    const label = avg === null ? 'no data' : `Ø ${avg <= 0 ? '0' : '+' + avg.toFixed(1)} min`;
-    const cancelledTxt = r.index && r.index.cancelledCount ? `<br>${r.index.cancelledCount} cancelled` : '';
+    const shortLabel = avg === null ? 'no data' : (avg <= 0 ? '0' : '+' + avg.toFixed(1));
+    const cancelledTxt = r.index && r.index.cancelledCount ? ` · ${r.index.cancelledCount} cnl.` : '';
     const marker = L.circleMarker(latlng, {
       radius: 7, weight: 1.5, color: '#14171a', fillColor: color, fillOpacity: .9,
-    }).bindTooltip(`<b>${r.stop.name}</b><br>${label}${cancelledTxt}`, { direction: 'top' });
+    }).bindTooltip(`${r.stop.name}: <b>${shortLabel}</b>${cancelledTxt}`, {
+      permanent: true, direction: 'top', offset: [0, -8], className: 'viewport-label',
+    });
     marker.on('click', () => showStationBoardFor(r.stop));
     marker.addTo(viewportLayer);
   });
@@ -769,7 +784,7 @@ function renderAreaOverview(results) {
     : 'n/a';
   el.innerHTML = `
     <div class="overview-title">Viewport delay overview</div>
-    <div class="overview-row">${ov.stationCount} station(s), ${ov.dataCount} with live data</div>
+    <div class="overview-row">${ov.stationCount} station(s), ${ov.dataCount} with data (last ${VIEWPORT_LOOKBACK_MIN} min)</div>
     <div class="overview-row">area average: <b style="color:var(--text)">${avgTxt}</b></div>
     <div class="overview-row">worst stop: ${worstTxt}</div>
     <div class="overview-row">${ov.totalCancelled} cancellation(s) across all stops</div>`;
