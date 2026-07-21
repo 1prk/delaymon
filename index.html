@@ -79,6 +79,10 @@
   #legend div{display:flex;align-items:center;gap:6px;margin:2px 0}
   #legend span.swatch{width:14px;height:4px;border-radius:2px;display:inline-block;flex:0 0 auto}
   #legendGradient{margin-bottom:6px}
+  #deltaToggleRow{display:flex;align-items:center;gap:6px;margin-bottom:8px;padding-bottom:8px;
+    border-bottom:1px solid var(--border);cursor:pointer;font-weight:600}
+  #deltaLegendGradient{margin-bottom:6px}
+  #deltaLegendGradient.hidden, #legendGradient.hidden{display:none}
   .legend-bar{height:8px;border-radius:4px;background:linear-gradient(90deg,
     #3fa96a 0%, #3fa96a 8%, #6cbf6a 8%, #6cbf6a 17%, #a0c94a 17%, #a0c94a 25%,
     #cfd44a 25%, #cfd44a 33%, #e8c65a 33%, #e8c65a 42%, #e8b04a 42%, #e8b04a 50%,
@@ -178,6 +182,10 @@
     <div id="map"></div>
     <div id="areaOverview" class="hidden"></div>
     <div id="legend">
+      <label id="deltaToggleRow">
+        <input type="checkbox" id="deltaViewToggle">
+        <span>Delta view (change per leg)</span>
+      </label>
       <div id="legendGradient">
         <div class="legend-bar"></div>
         <div class="legend-ticks">
@@ -185,6 +193,14 @@
           <span>10</span><span>15</span><span>20+</span>
         </div>
         <div class="legend-caption">delay (min)</div>
+      </div>
+      <div id="deltaLegendGradient" class="hidden">
+        <div><span class="swatch" style="background:#1f8a4c"></span> improving a lot</div>
+        <div><span class="swatch" style="background:#3fa96a"></span> improving</div>
+        <div><span class="swatch" style="background:#8b96a3"></span> steady</div>
+        <div><span class="swatch" style="background:#e8c65a"></span> worsening</div>
+        <div><span class="swatch" style="background:#c73e3e"></span> worsening a lot</div>
+        <div style="color:var(--muted)">grey = one end untracked — not "steady"</div>
       </div>
       <div><span class="swatch" style="background:#6b7280"></span> no realtime data</div>
       <div><span class="swatch" style="background:#7a2323"></span> cancelled stop/segment</div>
@@ -314,8 +330,31 @@ function hafasTimeToMinutes(t) {
   return h * 60 + m;
 }
 
-function delayMinutes(scheduled, real) {
-  if (!scheduled || !real) return null;
+// A departure/arrival with no realtime field at all is a purely scheduled
+// trip HAFAS hasn't started tracking yet — it must read as "no data"
+// (null), never as "0 min delay". Treating an untracked trip as
+// confirmed on-time would quietly pull every average toward "everything
+// is fine" using trips nobody has actually observed running yet.
+//
+// Some HAFAS installs additionally carry a prognosis-type field
+// (commonly dProgType/aProgType) that's empty specifically for stops not
+// yet actively tracked, even when a dTimeR placeholder value is already
+// present. That field name isn't confirmed for this install, so it's
+// only consulted when present — it can only make the check stricter,
+// never wrongly exclude data on installs that don't have it.
+function hasConfirmedRealtime(stop, kind) {
+  if (!stop || !stop[`${kind}TimeR`]) return false;
+  const progType = stop[`${kind}ProgType`];
+  if (progType !== undefined && !progType) return false;
+  return true;
+}
+
+// kind: 'a' for arrival, 'd' for departure.
+function delayMinutes(stop, kind) {
+  if (!hasConfirmedRealtime(stop, kind)) return null;
+  const scheduled = stop[`${kind}TimeS`];
+  const real = stop[`${kind}TimeR`];
+  if (!scheduled) return null;
   let d = hafasTimeToMinutes(real) - hafasTimeToMinutes(scheduled);
   if (d < -60) d += 1440; // day wraparound
   return d;
@@ -458,6 +497,10 @@ function setBasemap(which) {
 }
 
 let routeLayer = L.layerGroup().addTo(map);
+let segmentLayer = L.layerGroup().addTo(map);
+let deltaViewEnabled = false;
+let lastJourneyPoints = null;
+let lastJourneySegCoordsList = null;
 let viewportLayer = L.layerGroup().addTo(map);
 let stationMarker = null;
 let stationIndexTimer = null;
@@ -472,6 +515,11 @@ function stopVehicleTracking() {
 }
 
 /* --- live clock + timetable reference time --------------------------- */
+
+// A single upcoming departure is a thin sample to judge a stop's delay
+// by, so "Show from" defaults to looking an hour back instead of only
+// live/upcoming trips.
+const DEFAULT_LOOKBACK_MIN = 60;
 
 let currentStationLoc = null;
 let currentLookbackMin = 0;
@@ -595,7 +643,7 @@ function computeStopDelayIndex(jnyL) {
   jnyL.forEach(jny => {
     const stop = jny.stbStop || {};
     if (stopCancelled(stop)) { cancelledCount++; return; }
-    const mins = delayMinutes(stop.dTimeS, stop.dTimeR);
+    const mins = delayMinutes(stop, 'd');
     if (mins === null) return;
     sum += mins;
     count++;
@@ -814,20 +862,38 @@ function renderAreaOverview(results) {
 
 document.getElementById('btnFetchStations').addEventListener('click', fetchStationsInViewport);
 
+// Toggling delta view never re-fetches anything — it redraws purely
+// from the last drawn journey's cached points/geometry (lastJourneyPoints
+// / lastJourneySegCoordsList), since computeSegmentInfo just reads the
+// deltaViewEnabled flag. If nothing is drawn yet, it just flips state for
+// whenever a journey is next selected.
+document.getElementById('deltaViewToggle').addEventListener('change', (e) => {
+  deltaViewEnabled = e.target.checked;
+  document.getElementById('legendGradient').classList.toggle('hidden', deltaViewEnabled);
+  document.getElementById('deltaLegendGradient').classList.toggle('hidden', !deltaViewEnabled);
+  if (lastJourneyPoints) {
+    renderSegments(lastJourneyPoints, lastJourneySegCoordsList);
+    renderPearlChain(lastJourneyPoints);
+  }
+});
+
 async function selectStation(loc, itemEl) {
   document.querySelectorAll('#resultsPane .list-item').forEach(el => el.classList.remove('active'));
   if (itemEl) itemEl.classList.add('active');
   clearError();
   routeLayer.clearLayers();
+  segmentLayer.clearLayers();
   stopVehicleTracking();
   clearPearlChain();
+  lastJourneyPoints = null;
+  lastJourneySegCoordsList = null;
 
   if (loc.crd) {
     const latlng = [loc.crd.y / 1e6, loc.crd.x / 1e6];
     map.setView(latlng, 15);
   }
 
-  await showStationBoardFor(loc, 0);
+  await showStationBoardFor(loc, DEFAULT_LOOKBACK_MIN);
 }
 
 // Shared by search-result selection and clicking an "H" stop marker on the
@@ -840,7 +906,9 @@ async function selectStation(loc, itemEl) {
 // "now", which is how already-departed trips show up (the board returns
 // everything from that reference point forward, including runs whose
 // scheduled/real time is now in the past relative to the live clock).
-async function showStationBoardFor(loc, lookbackMin = 0) {
+// Defaults to DEFAULT_LOOKBACK_MIN (not "live") since a single upcoming
+// departure is a thin sample to judge a stop by.
+async function showStationBoardFor(loc, lookbackMin = DEFAULT_LOOKBACK_MIN) {
   clearError();
   currentStationLoc = loc;
   currentLookbackMin = lookbackMin;
@@ -926,7 +994,7 @@ function renderDepartures(res, stationLoc, lookbackMin = 0) {
     const prod = prodL[jny.prodX] || {};
     const stop = jny.stbStop || {};
     const cancelled = stopCancelled(stop);
-    const mins = delayMinutes(stop.dTimeS, stop.dTimeR);
+    const mins = delayMinutes(stop, 'd');
     const stopMin = hafasTimeToMinutes(stop.dTimeR || stop.dTimeS);
     const isDeparted = lookbackMin > 0 && stopMin !== null && nowMin !== null && stopMin < nowMin;
     const remarks = resolveRemarks(res.common, jny.msgL || stop.msgL);
@@ -954,8 +1022,11 @@ async function selectJourney(jny, itemEl) {
   if (itemEl) itemEl.classList.add('active');
   clearError();
   routeLayer.clearLayers();
+  segmentLayer.clearLayers();
   stopVehicleTracking();
   clearPearlChain();
+  lastJourneyPoints = null;
+  lastJourneySegCoordsList = null;
   try {
     const res = await journeyDetails(jny.jid);
     drawJourney(res, jny.jid);
@@ -1153,8 +1224,8 @@ function drawJourney(res, jid) {
     const loc = locL[stop.locX];
     if (!loc || !loc.crd) return;
     const latlng = [loc.crd.y / 1e6, loc.crd.x / 1e6];
-    const arrDelay = delayMinutes(stop.aTimeS, stop.aTimeR);
-    const depDelay = delayMinutes(stop.dTimeS, stop.dTimeR);
+    const arrDelay = delayMinutes(stop, 'a');
+    const depDelay = delayMinutes(stop, 'd');
     const delay = arrDelay !== null ? arrDelay : depDelay;
     const cancelled = stopCancelled(stop);
     const passBy = stopIsPassBy(stop);
@@ -1164,15 +1235,13 @@ function drawJourney(res, jid) {
 
   const matchIdxs = matchStopsToPolyline(routeCoords, points);
 
-  // Delay-colored segments, snapped to the real route geometry between
-  // each pair of consecutive stops, with a "+N min" label at the midpoint
-  // (or a "cancelled" label/dashing if either endpoint is cancelled).
-  // segCoordsList is kept around so the vehicle interpolation below walks
-  // the same geometry the coloring uses.
+  // segCoordsList: the actual route-geometry slice for each stop-to-stop
+  // leg, snapped to real geometry when available. Built once here and
+  // cached (lastJourneySegCoordsList) so toggling delta view later can
+  // redraw purely from cache, with no network refetch or re-snapping.
   const segCoordsList = [];
   for (let i = 0; i < points.length - 1; i++) {
     const a = points[i], b = points[i + 1];
-    const info = computeSegmentInfo(a, b);
     let segCoords;
     if (matchIdxs && matchIdxs[i + 1] > matchIdxs[i]) {
       segCoords = routeCoords.slice(matchIdxs[i], matchIdxs[i + 1] + 1);
@@ -1180,15 +1249,11 @@ function drawJourney(res, jid) {
       segCoords = [a.latlng, b.latlng];
     }
     segCoordsList.push(segCoords);
-    const segStyle = info.cancelled
-      ? { color: CANCEL_COLOR, weight: 6, opacity: .9, dashArray: '6,6' }
-      : { color: info.color, weight: 6, opacity: .9 };
-    L.polyline(segCoords, segStyle).addTo(routeLayer);
-
-    const mid = midpointByLength(segCoords);
-    const labelIcon = info.cancelled ? cancelledLabelIcon() : delayLabelIcon(info.delay);
-    L.marker(mid, { icon: labelIcon, interactive: false }).addTo(routeLayer);
   }
+
+  lastJourneyPoints = points;
+  lastJourneySegCoordsList = segCoordsList;
+  renderSegments(points, segCoordsList);
 
   // Stop markers: a colored circled "H" (or "✕" if cancelled), clickable
   // to browse that stop's other departures without losing the drawn
@@ -1219,12 +1284,83 @@ function drawJourney(res, jid) {
   startVehicleTracking(jid, points, segCoordsList, journey);
 }
 
-// Shared by the map-segment coloring above and the pearl-chain strip below,
-// so "how delayed is this leg" is computed exactly once per pair of stops.
+// Shared by the map-segment coloring, the pearl-chain strip, and the
+// delta-view toggle, so "how delayed is this leg" is computed exactly
+// once per pair of stops and both views can never disagree.
+//
+// Absolute mode: colored/labeled by the delay carried at the arrival
+// stop (same as before). Delta mode: colored/labeled by the CHANGE in
+// delay across just this leg (arrival delay at b minus departure delay
+// at a) — did the vehicle gain more delay here, lose some, or hold
+// steady? That's a different question from "how delayed is it now",
+// and conflating them was the whole reason to add the toggle.
+//
+// A delta can only be computed when BOTH endpoints have confirmed
+// realtime data (see hasConfirmedRealtime) — a scheduled/untracked
+// endpoint must render as "no data", never as an implied 0 change,
+// which would misrepresent an unmeasured leg as "steady".
 function computeSegmentInfo(a, b) {
   const cancelled = a.cancelled || b.cancelled;
+  if (deltaViewEnabled) {
+    if (cancelled) return { cancelled: true, isDelta: true, delay: null, color: CANCEL_COLOR };
+    if (a.depDelay === null || b.arrDelay === null) {
+      return { cancelled: false, isDelta: true, delay: null, color: '#6b7280' };
+    }
+    const delta = b.arrDelay - a.depDelay;
+    return { cancelled: false, isDelta: true, delay: delta, color: deltaColor(delta) };
+  }
   const delay = b.delay !== null ? b.delay : a.delay;
-  return { cancelled, delay, color: cancelled ? CANCEL_COLOR : delayColor(delay) };
+  return { cancelled, isDelta: false, delay, color: cancelled ? CANCEL_COLOR : delayColor(delay) };
+}
+
+// Diverging scale for delta mode: green = the leg improved on the delay
+// it started with, red/orange = it got worse, grey-blue = essentially
+// unchanged (carrying forward existing delay without adding to it).
+function deltaColor(delta) {
+  if (delta === null || delta === undefined) return '#6b7280';
+  if (delta <= -5) return '#1f8a4c';
+  if (delta <= -2) return '#3fa96a';
+  if (delta <= -1) return '#7fc47a';
+  if (delta < 1) return '#8b96a3';
+  if (delta <= 2) return '#e8c65a';
+  if (delta <= 5) return '#e08a3f';
+  if (delta <= 10) return '#e2703f';
+  return '#c73e3e';
+}
+
+function deltaLabelIcon(delta) {
+  const text = delta === null || delta === undefined
+    ? 'n/a'
+    : (delta === 0 ? 'Δ0' : `Δ${delta > 0 ? '+' : ''}${delta.toFixed(1)}`);
+  return L.divIcon({
+    className: 'delay-label-wrap',
+    html: `<div class="delay-label" style="background:${deltaColor(delta)}">${text}</div>`,
+    iconSize: [50, 16],
+    iconAnchor: [25, 8],
+  });
+}
+
+// Draws (or redraws, on delta-view toggle) the delay/delta-colored
+// segments between consecutive stops into segmentLayer, independent of
+// the H markers / vehicle marker in routeLayer — so toggling delta view
+// only needs to redraw this, from cached geometry, no refetch.
+function renderSegments(points, segCoordsList) {
+  segmentLayer.clearLayers();
+  for (let i = 0; i < points.length - 1; i++) {
+    const a = points[i], b = points[i + 1];
+    const info = computeSegmentInfo(a, b);
+    const segCoords = segCoordsList[i];
+    const segStyle = info.cancelled
+      ? { color: CANCEL_COLOR, weight: 6, opacity: .9, dashArray: '6,6' }
+      : { color: info.color, weight: 6, opacity: .9 };
+    L.polyline(segCoords, segStyle).addTo(segmentLayer);
+
+    const mid = midpointByLength(segCoords);
+    const labelIcon = info.cancelled
+      ? cancelledLabelIcon()
+      : (info.isDelta ? deltaLabelIcon(info.delay) : delayLabelIcon(info.delay));
+    L.marker(mid, { icon: labelIcon, interactive: false }).addTo(segmentLayer);
+  }
 }
 
 function clearPearlChain() {
