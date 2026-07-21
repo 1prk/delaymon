@@ -68,7 +68,7 @@
     color:var(--text);font-size:11px;cursor:pointer}
   #btnFetchStations:disabled{opacity:.5;cursor:default}
   #viewportStatus{font-size:10px;color:var(--muted);min-height:12px}
-  #areaOverview{position:absolute;top:16px;left:16px;background:rgba(20,24,28,.92);border:1px solid var(--border);
+  #areaOverview{position:absolute;top:90px;left:16px;background:rgba(20,24,28,.92);border:1px solid var(--border);
     border-radius:8px;padding:8px 12px;font-size:11px;z-index:600;color:var(--text);max-width:250px}
   #areaOverview.hidden{display:none}
   #areaOverview .overview-title{font-weight:700;margin-bottom:4px}
@@ -158,6 +158,13 @@
       <button id="btnLight">Carto Light</button>
     </div>
     <div id="viewportRow">
+      <label for="viewportLookbackSelect" style="font-size:11px;color:var(--muted)">Include departures from</label>
+      <select id="viewportLookbackSelect">
+        <option value="0">now (live)</option>
+        <option value="60" selected>last 1 hour</option>
+        <option value="30">last 30 min</option>
+        <option value="120">last 2 hours</option>
+      </select>
       <button id="btnFetchStations">Fetch stations in view</button>
       <span id="viewportStatus"></span>
     </div>
@@ -670,7 +677,7 @@ function startStopIndexPolling(loc) {
 // than firing all of them at once.
 const VIEWPORT_MAX_STOPS = 60;
 const VIEWPORT_CONCURRENCY = 4;
-const VIEWPORT_LOOKBACK_MIN = 60;
+let lastViewportLookbackMin = 0;
 
 async function fetchWithConcurrencyLimit(items, limit, worker, onProgress) {
   const results = new Array(items.length);
@@ -690,11 +697,13 @@ async function fetchWithConcurrencyLimit(items, limit, worker, onProgress) {
 
 async function fetchStationsInViewport() {
   const btn = document.getElementById('btnFetchStations');
+  const lookbackSelect = document.getElementById('viewportLookbackSelect');
   const status = document.getElementById('viewportStatus');
   clearError();
   viewportLayer.clearLayers();
   document.getElementById('areaOverview').classList.add('hidden');
   btn.disabled = true;
+  lookbackSelect.disabled = true;
   status.textContent = 'Finding stations in view…';
 
   try {
@@ -713,13 +722,19 @@ async function fetchStationsInViewport() {
       return;
     }
 
-    // A 1-hour lookback per stop (same mechanism as a single stop's "Show
-    // from" selector) instead of "now": low-frequency stops can have very
-    // few upcoming departures to average over, so pulling in the last
-    // hour's already-departed runs too gives a sturdier index — comparing
-    // stops on 1 upcoming tram vs. another's 8 is not a fair comparison.
-    const refDate = new Date(Date.now() - VIEWPORT_LOOKBACK_MIN * 60000);
-    status.textContent = `Loading delay data (last ${VIEWPORT_LOOKBACK_MIN} min) — 0/${stops.length}`;
+    // Lookback minutes come from the "Include departures from" selector
+    // (same mechanism as a single stop's "Show from" dropdown), not a
+    // silent hardcoded value — low-frequency stops can have very few
+    // upcoming departures to average over, so pulling in already-departed
+    // runs from further back gives a sturdier index (comparing one
+    // stop's 1 upcoming tram against another's 8 isn't a fair
+    // comparison), but how far back is the user's explicit choice.
+    const lookbackMin = parseInt(document.getElementById('viewportLookbackSelect').value, 10);
+    lastViewportLookbackMin = lookbackMin;
+    const refDate = lookbackMin > 0 ? new Date(Date.now() - lookbackMin * 60000) : null;
+    status.textContent = lookbackMin > 0
+      ? `Loading delay data (last ${lookbackMin} min) — 0/${stops.length}`
+      : `Loading delay data — 0/${stops.length}`;
     const results = await fetchWithConcurrencyLimit(
       stops,
       VIEWPORT_CONCURRENCY,
@@ -741,6 +756,7 @@ async function fetchStationsInViewport() {
     handleFetchError(e);
   } finally {
     btn.disabled = false;
+    lookbackSelect.disabled = false;
   }
 }
 
@@ -749,20 +765,30 @@ function renderViewportStations(results) {
   // readable at a glance across the whole viewport — the point of this
   // view is comparing many stops at once to spot the worst performer,
   // which a hover-one-at-a-time tooltip defeats.
+  //
+  // Each marker is built in its own try/catch: one malformed entry (e.g.
+  // an unexpected field shape from a live response we couldn't test
+  // against) throwing would otherwise abort forEach partway through and
+  // silently leave the rest of the viewport with no labels at all.
   results.forEach(r => {
-    if (!r || !r.stop.crd) return;
-    const latlng = [r.stop.crd.y / 1e6, r.stop.crd.x / 1e6];
-    const avg = r.index ? r.index.avg : null;
-    const color = avg === null ? '#6b7280' : delayColor(avg);
-    const shortLabel = avg === null ? 'no data' : (avg <= 0 ? '0' : '+' + avg.toFixed(1));
-    const cancelledTxt = r.index && r.index.cancelledCount ? ` · ${r.index.cancelledCount} cnl.` : '';
-    const marker = L.circleMarker(latlng, {
-      radius: 7, weight: 1.5, color: '#14171a', fillColor: color, fillOpacity: .9,
-    }).bindTooltip(`${r.stop.name}: <b>${shortLabel}</b>${cancelledTxt}`, {
-      permanent: true, direction: 'top', offset: [0, -8], className: 'viewport-label',
-    });
-    marker.on('click', () => showStationBoardFor(r.stop));
-    marker.addTo(viewportLayer);
+    try {
+      if (!r || !r.stop || !r.stop.crd) return;
+      const latlng = [r.stop.crd.y / 1e6, r.stop.crd.x / 1e6];
+      const avg = r.index ? r.index.avg : null;
+      const color = avg === null ? '#6b7280' : delayColor(avg);
+      const shortLabel = avg === null ? 'no data' : (avg <= 0 ? '0' : '+' + avg.toFixed(1));
+      const cancelledTxt = r.index && r.index.cancelledCount ? ` · ${r.index.cancelledCount} cnl.` : '';
+      const marker = L.circleMarker(latlng, {
+        radius: 7, weight: 1.5, color: '#14171a', fillColor: color, fillOpacity: .9,
+      }).bindTooltip(`${r.stop.name}: <b>${shortLabel}</b>${cancelledTxt}`, {
+        permanent: true, direction: 'top', offset: [0, -8], className: 'viewport-label',
+      });
+      marker.on('click', () => showStationBoardFor(r.stop));
+      marker.addTo(viewportLayer);
+      marker.openTooltip(); // belt-and-suspenders: force it open even if addTo's own auto-open ever misses
+    } catch (e) {
+      console.error('Skipping one viewport station marker due to unexpected data shape:', e, r);
+    }
   });
   renderAreaOverview(results);
 }
@@ -784,7 +810,7 @@ function renderAreaOverview(results) {
     : 'n/a';
   el.innerHTML = `
     <div class="overview-title">Viewport delay overview</div>
-    <div class="overview-row">${ov.stationCount} station(s), ${ov.dataCount} with data (last ${VIEWPORT_LOOKBACK_MIN} min)</div>
+    <div class="overview-row">${ov.stationCount} station(s), ${ov.dataCount} with data${lastViewportLookbackMin > 0 ? ` (last ${lastViewportLookbackMin} min)` : ' (live)'}</div>
     <div class="overview-row">area average: <b style="color:var(--text)">${avgTxt}</b></div>
     <div class="overview-row">worst stop: ${worstTxt}</div>
     <div class="overview-row">${ov.totalCancelled} cancellation(s) across all stops</div>`;
