@@ -20,6 +20,18 @@
   .pad{padding:12px 14px}
   h1{font-size:15px;margin:0 0 10px;font-weight:600;letter-spacing:.2px}
   h1 small{color:var(--muted);font-weight:400;display:block;font-size:11px;margin-top:2px}
+  #clockBox{display:flex;justify-content:space-between;gap:10px;font-size:11px;font-variant-numeric:tabular-nums;
+    background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:6px 10px;margin-bottom:10px}
+  #clockBox .clock-label{color:var(--muted);margin-right:6px}
+  #clockBox .clock-value{font-weight:600;letter-spacing:.3px}
+  #clockBox .clock-value.live-ref{color:#5fd28a}
+  #clockBox .clock-value.past-ref{color:#e8c65a}
+  #lookbackRow{display:flex;align-items:center;gap:8px;padding:8px 14px;border-bottom:1px solid var(--border)}
+  #lookbackRow label{font-size:11px;color:var(--muted)}
+  #lookbackSelect{flex:1;padding:5px 6px;border-radius:6px;border:1px solid var(--border);background:var(--panel2);
+    color:var(--text);font-size:12px}
+  .list-item.departed{opacity:.55}
+  .departed-tag{background:#262b31;color:var(--muted)}
   #searchBox{position:relative}
   #searchInput{width:100%;padding:9px 10px;border-radius:8px;border:1px solid var(--border);
     background:var(--panel2);color:var(--text);font-size:13px;outline:none}
@@ -61,7 +73,6 @@
   .vehicle-marker-wrap{background:transparent;border:none}
   .vehicle-marker{width:16px;height:16px;border-radius:50%;border:3px solid #fff;
     animation:vehiclePulse 1.6s ease-in-out infinite}
-  .leaflet-marker-icon.vehicle-marker-wrap{transition:transform 1.8s linear}
   @keyframes vehiclePulse{
     0%,100%{box-shadow:0 0 0 4px rgba(255,255,255,.28)}
     50%{box-shadow:0 0 0 9px rgba(255,255,255,.08)}
@@ -77,6 +88,10 @@
   <div id="sidebar">
     <div class="pad">
       <h1>Delaymon<small>Transit delays per line segment — INSA/LVB (Leipzig)</small></h1>
+      <div id="clockBox">
+        <div><span class="clock-label">Now</span><span id="nowClock" class="clock-value">--:--:--</span></div>
+        <div><span class="clock-label">Data as of</span><span id="dataAsOfClock" class="clock-value">--:--:--</span></div>
+      </div>
       <div id="searchBox">
         <input id="searchInput" type="text" placeholder="Search stop, e.g. Hauptbahnhof…" autocomplete="off">
         <div id="searchStatus"></div>
@@ -105,6 +120,7 @@
   <div><span class="swatch" style="background:#6b7280"></span> no realtime data</div>
   <div style="margin-top:4px;color:var(--muted)">Click a stop's <b>H</b> marker for its other lines</div>
   <div style="margin-top:4px;color:var(--muted)">Pulsing dot = approximate vehicle position (interpolated, not GPS)</div>
+  <div style="margin-top:4px;color:var(--muted)">Use "Show from" in a stop's list to see past/departed trips</div>
 </div>
 
 <script>
@@ -172,14 +188,23 @@ function locMatch(query) {
   });
 }
 
-function stationBoard(loc) {
-  return hafas('StationBoard', {
+// refDate: optional JS Date to anchor the board on (instead of "now"),
+// which is how past/departed trips are surfaced — StationBoard returns
+// everything from that reference point forward, so anchoring it earlier
+// than now includes already-departed runs.
+function stationBoard(loc, refDate) {
+  const req = {
     jnyFltrL: [{ type: 'PROD', mode: 'INC', value: 1023 }],
     stbLoc: loc,
     type: 'DEP',
     sort: 'PT',
     maxJny: 40,
-  });
+  };
+  if (refDate) {
+    req.date = hafasDateString(refDate);
+    req.time = hafasTimeString(refDate);
+  }
+  return hafas('StationBoard', req);
 }
 
 function journeyDetails(jid) {
@@ -223,6 +248,18 @@ function fmtClock(t) {
   if (!t) return '—';
   const s = t.padStart(6, '0');
   return `${s.slice(0, 2)}:${s.slice(2, 4)}`;
+}
+
+function pad2(n) { return String(n).padStart(2, '0'); }
+
+function hafasDateString(d) {
+  return `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}`;
+}
+function hafasTimeString(d) {
+  return `${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}`;
+}
+function fmtClockSec(d) {
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
 }
 
 // Standard "encoded polyline" decoder (Google algorithm). HAFAS commonly
@@ -279,11 +316,29 @@ let routeLayer = L.layerGroup().addTo(map);
 let stationMarker = null;
 let vehicleMarker = null;
 let vehicleTimer = null;
+let vehicleAnimHandle = null;
 
 function stopVehicleTracking() {
   if (vehicleTimer) { clearInterval(vehicleTimer); vehicleTimer = null; }
+  if (vehicleAnimHandle) { cancelAnimationFrame(vehicleAnimHandle); vehicleAnimHandle = null; }
   vehicleMarker = null; // owned by routeLayer; cleared along with it
 }
+
+/* --- live clock + timetable reference time --------------------------- */
+
+let currentStationLoc = null;
+let currentLookbackMin = 0;
+let dataAsOf = new Date();
+
+function tickClock() {
+  document.getElementById('nowClock').textContent = fmtClockSec(new Date());
+  const el = document.getElementById('dataAsOfClock');
+  el.textContent = fmtClockSec(dataAsOf);
+  el.classList.toggle('live-ref', currentLookbackMin === 0);
+  el.classList.toggle('past-ref', currentLookbackMin !== 0);
+}
+setInterval(tickClock, 1000);
+tickClock();
 
 /* --- UI plumbing ----------------------------------------------------- */
 
@@ -367,26 +422,36 @@ async function selectStation(loc, itemEl) {
     stationMarker = L.circleMarker(latlng, { radius: 6, color: '#4da3ff', weight: 2, fillOpacity: .8 }).addTo(map);
   }
 
-  await showStationBoardFor(loc);
+  await showStationBoardFor(loc, 0);
 }
 
 // Shared by search-result selection and clicking an "H" stop marker on the
 // map — fetches and renders the departures list for a stop, without
 // touching the current map view/route (so clicking a stop mid-route lets
 // you browse its other lines without losing context).
-async function showStationBoardFor(loc) {
+//
+// lookbackMin > 0 anchors StationBoard on a past reference time instead of
+// "now", which is how already-departed trips show up (the board returns
+// everything from that reference point forward, including runs whose
+// scheduled/real time is now in the past relative to the live clock).
+async function showStationBoardFor(loc, lookbackMin = 0) {
   clearError();
+  currentStationLoc = loc;
+  currentLookbackMin = lookbackMin;
   resultsPane.innerHTML = '<div class="empty-hint">Loading departures…</div>';
   try {
-    const res = await stationBoard({ name: loc.name, lid: loc.lid });
-    renderDepartures(res, loc);
+    const refDate = lookbackMin > 0 ? new Date(Date.now() - lookbackMin * 60000) : new Date();
+    dataAsOf = refDate;
+    tickClock();
+    const res = await stationBoard({ name: loc.name, lid: loc.lid }, lookbackMin > 0 ? refDate : null);
+    renderDepartures(res, loc, lookbackMin);
   } catch (e) {
     resultsPane.innerHTML = '';
     handleFetchError(e);
   }
 }
 
-function renderDepartures(res, stationLoc) {
+function renderDepartures(res, stationLoc, lookbackMin = 0) {
   const prodL = (res.common && res.common.prodL) || [];
   const jnyL = res.jnyL || [];
   resultsPane.innerHTML = '';
@@ -396,9 +461,28 @@ function renderDepartures(res, stationLoc) {
   back.style.color = 'var(--accent)';
   back.textContent = '← back to search';
   back.addEventListener('click', () => {
+    currentStationLoc = null;
     resultsPane.innerHTML = '<div class="empty-hint">Type a stop name above to search again.</div>';
   });
   resultsPane.appendChild(back);
+
+  const lookbackRow = document.createElement('div');
+  lookbackRow.id = 'lookbackRow';
+  lookbackRow.innerHTML = `
+    <label for="lookbackSelect">Show from</label>
+    <select id="lookbackSelect">
+      <option value="0">now (live)</option>
+      <option value="15">15 min ago</option>
+      <option value="30">30 min ago</option>
+      <option value="60">1 hour ago</option>
+      <option value="120">2 hours ago</option>
+    </select>`;
+  resultsPane.appendChild(lookbackRow);
+  const lookbackSelect = lookbackRow.querySelector('#lookbackSelect');
+  lookbackSelect.value = String(lookbackMin);
+  lookbackSelect.addEventListener('change', (e) => {
+    showStationBoardFor(stationLoc, parseInt(e.target.value, 10));
+  });
 
   const title = document.createElement('div');
   title.className = 'section-title';
@@ -408,21 +492,25 @@ function renderDepartures(res, stationLoc) {
   if (!jnyL.length) {
     const empty = document.createElement('div');
     empty.className = 'empty-hint';
-    empty.textContent = 'No upcoming departures returned for this stop.';
+    empty.textContent = 'No departures returned for this stop/time range.';
     resultsPane.appendChild(empty);
     return;
   }
 
+  const nowMin = hafasTimeToMinutes(hafasTimeString(new Date()));
   jnyL.forEach(jny => {
     const prod = prodL[jny.prodX] || {};
     const stop = jny.stbStop || {};
     const mins = delayMinutes(stop.dTimeS, stop.dTimeR);
+    const stopMin = hafasTimeToMinutes(stop.dTimeR || stop.dTimeS);
+    const isDeparted = lookbackMin > 0 && stopMin !== null && nowMin !== null && stopMin < nowMin;
     const item = document.createElement('div');
-    item.className = 'list-item';
+    item.className = 'list-item' + (isDeparted ? ' departed' : '');
     item.innerHTML = `
       <div class="line-row">
         <span class="line-badge" style="background:${delayColor(mins)}">${prod.name || '?'}</span>
         <span class="line-dir">${jny.dirTxt || ''}</span>
+        ${isDeparted ? '<span class="delay-badge departed-tag">departed</span>' : ''}
       </div>
       <div class="sub">${fmtClock(stop.dTimeS)}${mins !== null ? ` → ${fmtClock(stop.dTimeR)}` : ''}
         <span class="delay-badge ${delayClass(mins)}" style="margin-left:6px">
@@ -544,6 +632,35 @@ function pointAtFraction(coords, frac) {
   return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
 }
 
+// True midpoint by arc length along a coordinate list (as opposed to the
+// middle *vertex*, which — after snapping stops onto an unevenly-sampled
+// route polyline — can sit anywhere from one end of the segment to the
+// other, landing the label on top of a stop's "H" marker). Used to place
+// the "+N min" delay label at the visual center of each drawn segment.
+function midpointByLength(coords) {
+  if (!coords || !coords.length) return null;
+  if (coords.length === 1) return coords[0];
+  let total = 0;
+  for (let i = 1; i < coords.length; i++) {
+    const dLat = coords[i][0] - coords[i - 1][0], dLng = coords[i][1] - coords[i - 1][1];
+    total += Math.sqrt(dLat * dLat + dLng * dLng);
+  }
+  if (total === 0) return coords[Math.floor(coords.length / 2)];
+  const target = total / 2;
+  let acc = 0;
+  for (let i = 1; i < coords.length; i++) {
+    const a = coords[i - 1], b = coords[i];
+    const dLat = b[0] - a[0], dLng = b[1] - a[1];
+    const segLen = Math.sqrt(dLat * dLat + dLng * dLng);
+    if (acc + segLen >= target) {
+      const t = segLen === 0 ? 0 : (target - acc) / segLen;
+      return [a[0] + dLat * t, a[1] + dLng * t];
+    }
+    acc += segLen;
+  }
+  return coords[coords.length - 1];
+}
+
 // Approximates the vehicle's current position: this is NOT live GPS (this
 // HAFAS endpoint doesn't expose one that we could confirm), it's a
 // schedule interpolation — for whichever stop-to-stop leg `now` falls
@@ -624,7 +741,7 @@ function drawJourney(res) {
     segCoordsList.push(segCoords);
     L.polyline(segCoords, { color: delayColor(segDelay), weight: 6, opacity: .9 }).addTo(routeLayer);
 
-    const mid = segCoords[Math.floor(segCoords.length / 2)];
+    const mid = midpointByLength(segCoords);
     L.marker(mid, { icon: delayLabelIcon(segDelay), interactive: false }).addTo(routeLayer);
   }
 
@@ -650,28 +767,57 @@ function drawJourney(res) {
   startVehicleTracking(points, segCoordsList);
 }
 
-// Ticks the interpolated vehicle marker forward every 2s. Not live GPS —
-// see computeVehiclePosition's comment — but a smoothly-updating best
-// guess of where the vehicle is right now, given schedule + delay.
+// Ticks the interpolated vehicle position forward every 2s and glides the
+// marker to it. Not live GPS — see computeVehiclePosition's comment — but
+// a smoothly-updating best guess of where the vehicle is right now, given
+// schedule + delay.
+//
+// The glide is done by hand with requestAnimationFrame rather than a CSS
+// transition on the marker's transform: Leaflet also rewrites that same
+// transform on every zoom/pan frame to keep the marker glued to its
+// lat/lng, and a CSS transition fights that rewrite, producing a visible
+// lag/drift while zooming. Driving position purely through setLatLng here
+// avoids the conflict — Leaflet repositions instantly and correctly on
+// zoom no matter where we are mid-glide.
 function startVehicleTracking(points, segCoordsList) {
   stopVehicleTracking();
+  const TICK_MS = 2000;
+  let displayLatLng = null;
+
+  function animate(target) {
+    if (vehicleAnimHandle) cancelAnimationFrame(vehicleAnimHandle);
+    const from = displayLatLng;
+    const start = performance.now();
+    const step = (now) => {
+      const t = Math.min(1, (now - start) / TICK_MS);
+      const lat = from[0] + (target[0] - from[0]) * t;
+      const lng = from[1] + (target[1] - from[1]) * t;
+      if (vehicleMarker) vehicleMarker.setLatLng([lat, lng]);
+      displayLatLng = [lat, lng];
+      if (t < 1) vehicleAnimHandle = requestAnimationFrame(step);
+    };
+    vehicleAnimHandle = requestAnimationFrame(step);
+  }
+
   const tick = () => {
     const pos = computeVehiclePosition(points, segCoordsList);
     if (!pos) {
       if (vehicleMarker) { routeLayer.removeLayer(vehicleMarker); vehicleMarker = null; }
+      displayLatLng = null;
       return;
     }
     if (!vehicleMarker) {
       vehicleMarker = L.marker(pos.latlng, { icon: vehicleIcon(delayColor(pos.delay)), zIndexOffset: 1000 })
         .bindTooltip('approximate position (interpolated from timetable + delay, not live GPS)', { direction: 'top' })
         .addTo(routeLayer);
+      displayLatLng = pos.latlng;
     } else {
-      vehicleMarker.setLatLng(pos.latlng);
       vehicleMarker.setIcon(vehicleIcon(delayColor(pos.delay)));
+      animate(pos.latlng);
     }
   };
   tick();
-  vehicleTimer = setInterval(tick, 2000);
+  vehicleTimer = setInterval(tick, TICK_MS);
 }
 </script>
 </body>
