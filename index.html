@@ -51,6 +51,13 @@
   #legend span.swatch{width:14px;height:4px;border-radius:2px;display:inline-block}
   #error{padding:10px 14px;font-size:12px;background:#3a1f1f;color:#f4a3a3;border-bottom:1px solid var(--border);display:none;
     white-space:pre-wrap}
+  .h-marker-wrap{background:transparent;border:none}
+  .h-marker{width:22px;height:22px;border-radius:50%;background:#14171a;border:2.5px solid;display:flex;
+    align-items:center;justify-content:center;font-weight:800;font-size:12px;font-family:sans-serif;
+    box-shadow:0 0 0 2px rgba(0,0,0,.45);cursor:pointer}
+  .delay-label-wrap{background:transparent;border:none}
+  .delay-label{padding:1px 6px;border-radius:8px;font-size:10px;font-weight:700;color:#0b0e10;text-align:center;
+    white-space:nowrap;box-shadow:0 1px 3px rgba(0,0,0,.5);font-family:sans-serif}
   ::-webkit-scrollbar{width:8px}
   ::-webkit-scrollbar-thumb{background:#333a42;border-radius:4px}
   .empty-hint{padding:14px;color:var(--muted);font-size:12px;line-height:1.5}
@@ -88,6 +95,7 @@
   <div><span class="swatch" style="background:#e08a3f"></span> 6–10 min late</div>
   <div><span class="swatch" style="background:#e5484d"></span> &gt;10 min late</div>
   <div><span class="swatch" style="background:#6b7280"></span> no realtime data</div>
+  <div style="margin-top:4px;color:var(--muted)">Click a stop's <b>H</b> marker for its other lines</div>
 </div>
 
 <script>
@@ -342,6 +350,15 @@ async function selectStation(loc, itemEl) {
     stationMarker = L.circleMarker(latlng, { radius: 6, color: '#4da3ff', weight: 2, fillOpacity: .8 }).addTo(map);
   }
 
+  await showStationBoardFor(loc);
+}
+
+// Shared by search-result selection and clicking an "H" stop marker on the
+// map — fetches and renders the departures list for a stop, without
+// touching the current map view/route (so clicking a stop mid-route lets
+// you browse its other lines without losing context).
+async function showStationBoardFor(loc) {
+  clearError();
   resultsPane.innerHTML = '<div class="empty-hint">Loading departures…</div>';
   try {
     const res = await stationBoard({ name: loc.name, lid: loc.lid });
@@ -413,25 +430,67 @@ async function selectJourney(jny, itemEl) {
   }
 }
 
+function hIcon(color) {
+  return L.divIcon({
+    className: 'h-marker-wrap',
+    html: `<div class="h-marker" style="border-color:${color};color:${color}">H</div>`,
+    iconSize: [22, 22],
+    iconAnchor: [11, 11],
+  });
+}
+
+function delayLabelIcon(minutes) {
+  const text = minutes === null || minutes === undefined ? '' : (minutes <= 0 ? '0' : `+${minutes}`);
+  return L.divIcon({
+    className: 'delay-label-wrap',
+    html: `<div class="delay-label" style="background:${delayColor(minutes)}">${text} min</div>`,
+    iconSize: [44, 16],
+    iconAnchor: [22, 8],
+  });
+}
+
+// Finds, for each stop's lat/lng, the closest vertex on the decoded route
+// polyline — searching only forward from the previous match so indices
+// stay in travel order even if the route loops near itself. This is what
+// lets segments follow the road/track shape instead of a straight line
+// between stops.
+function matchStopsToPolyline(coords, points) {
+  if (!coords || !coords.length) return null;
+  const idxs = [];
+  let start = 0;
+  for (const p of points) {
+    let bestIdx = start, bestDist = Infinity;
+    for (let i = start; i < coords.length; i++) {
+      const dLat = coords[i][0] - p.latlng[0], dLng = coords[i][1] - p.latlng[1];
+      const dist = dLat * dLat + dLng * dLng;
+      if (dist < bestDist) { bestDist = dist; bestIdx = i; }
+    }
+    idxs.push(bestIdx);
+    start = bestIdx;
+  }
+  return idxs;
+}
+
 function drawJourney(res) {
   const locL = (res.common && res.common.locL) || [];
   const polyL = (res.common && res.common.polyL) || [];
   const journey = res.journey || res; // some installs put stopL at top level
   const stopL = journey.stopL || [];
 
-  // Base route shape from the encoded polyline, if present — drawn as a
-  // thin neutral guide line under the delay-colored stop-to-stop segments.
+  // Decode the route's encoded polyline (road/track-following shape), if
+  // the server provided one — this is what we snap stop positions onto so
+  // delay-colored segments follow the actual geometry, not straight lines.
+  let routeCoords = null;
   const polyIdx = journey.polyG && journey.polyG.polyXL && journey.polyG.polyXL[0];
   if (polyL.length && polyIdx !== undefined && polyL[polyIdx]) {
     const raw = polyL[polyIdx].crdEncYX || polyL[polyIdx].crdEncXY;
     if (raw) {
-      let coords = decodePolyline(raw);
-      if (polyL[polyIdx].crdEncXY) coords = coords.map(([a, b]) => [b, a]); // XY -> lat,lng
-      L.polyline(coords, { color: '#5b6572', weight: 3, opacity: .55 }).addTo(routeLayer);
+      routeCoords = decodePolyline(raw);
+      if (polyL[polyIdx].crdEncXY) routeCoords = routeCoords.map(([a, b]) => [b, a]); // XY -> lat,lng
     }
   }
 
-  // Per-stop markers + delay-colored segments between consecutive stops.
+  // Per-stop points, each carrying its own delay.
   const points = [];
   stopL.forEach(stop => {
     const loc = locL[stop.locX];
@@ -440,24 +499,41 @@ function drawJourney(res) {
     const arrDelay = delayMinutes(stop.aTimeS, stop.aTimeR);
     const depDelay = delayMinutes(stop.dTimeS, stop.dTimeR);
     const delay = arrDelay !== null ? arrDelay : depDelay;
-    points.push({ latlng, delay, name: loc.name, stop });
-
-    L.circleMarker(latlng, {
-      radius: 5, color: delayColor(delay), weight: 2, fillColor: delayColor(delay), fillOpacity: .9,
-    }).bindTooltip(
-      `<b>${loc.name}</b><br>arr ${fmtClock(stop.aTimeS)}${arrDelay !== null ? ` (${arrDelay <= 0 ? 'on time' : '+' + arrDelay + ' min'})` : ''}` +
-      `<br>dep ${fmtClock(stop.dTimeS)}${depDelay !== null ? ` (${depDelay <= 0 ? 'on time' : '+' + depDelay + ' min'})` : ''}`,
-      { direction: 'top' }
-    ).addTo(routeLayer);
+    points.push({ latlng, delay, arrDelay, depDelay, loc, stop });
   });
 
+  const matchIdxs = matchStopsToPolyline(routeCoords, points);
+
+  // Delay-colored segments, snapped to the real route geometry between
+  // each pair of consecutive stops, with a "+N min" label at the midpoint.
   for (let i = 0; i < points.length - 1; i++) {
     const a = points[i], b = points[i + 1];
     const segDelay = b.delay !== null ? b.delay : a.delay;
-    L.polyline([a.latlng, b.latlng], {
-      color: delayColor(segDelay), weight: 6, opacity: .9,
-    }).addTo(routeLayer);
+    let segCoords;
+    if (matchIdxs && matchIdxs[i + 1] > matchIdxs[i]) {
+      segCoords = routeCoords.slice(matchIdxs[i], matchIdxs[i + 1] + 1);
+    } else {
+      segCoords = [a.latlng, b.latlng];
+    }
+    L.polyline(segCoords, { color: delayColor(segDelay), weight: 6, opacity: .9 }).addTo(routeLayer);
+
+    const mid = segCoords[Math.floor(segCoords.length / 2)];
+    L.marker(mid, { icon: delayLabelIcon(segDelay), interactive: false }).addTo(routeLayer);
   }
+
+  // Stop markers: a colored circled "H", clickable to browse that stop's
+  // other departures without losing the drawn route.
+  points.forEach(p => {
+    const { loc, stop, arrDelay, depDelay, delay } = p;
+    const marker = L.marker(p.latlng, { icon: hIcon(delayColor(delay)) }).bindTooltip(
+      `<b>${loc.name}</b><br>arr ${fmtClock(stop.aTimeS)}${arrDelay !== null ? ` (${arrDelay <= 0 ? 'on time' : '+' + arrDelay + ' min'})` : ''}` +
+      `<br>dep ${fmtClock(stop.dTimeS)}${depDelay !== null ? ` (${depDelay <= 0 ? 'on time' : '+' + depDelay + ' min'})` : ''}` +
+      `<br><i>click for more lines at this stop</i>`,
+      { direction: 'top' }
+    );
+    marker.on('click', () => showStationBoardFor({ name: loc.name, lid: loc.lid }));
+    marker.addTo(routeLayer);
+  });
 
   if (points.length) {
     const bounds = L.latLngBounds(points.map(p => p.latlng));
