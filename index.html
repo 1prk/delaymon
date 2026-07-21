@@ -34,9 +34,6 @@
   #stopIndexBar{display:flex;flex-wrap:wrap;gap:6px;padding:8px 14px;border-bottom:1px solid var(--border)}
   .stop-index-chip{padding:2px 8px;border-radius:10px;background:var(--panel2);color:var(--text);font-size:11px}
   .stop-index-chip.accent{font-weight:700}
-  .stop-index-wrap{background:transparent;border:none}
-  .stop-index-badge{padding:3px 8px;border-radius:10px;font-size:11px;font-weight:700;color:#0b0e10;
-    white-space:nowrap;box-shadow:0 2px 6px rgba(0,0,0,.5);text-align:center;cursor:pointer;font-family:sans-serif}
   .list-item.departed{opacity:.55}
   .departed-tag{background:#262b31;color:var(--muted)}
   #searchBox{position:relative}
@@ -194,7 +191,7 @@
       <div style="margin-top:4px;color:var(--muted)">Click a stop's <b>H</b> marker for its other lines</div>
       <div style="margin-top:4px;color:var(--muted)">Pulsing dot = vehicle position (live GPS if reported, else interpolated)</div>
       <div style="margin-top:4px;color:var(--muted)">Use "Show from" in a stop's list to see past/departed trips</div>
-      <div style="margin-top:4px;color:var(--muted)">"Ø +N min" badge = live delay index for the queried stop — click for details</div>
+      <div style="margin-top:4px;color:var(--muted)">Click the pulsing highlight marker for the queried stop's delay index</div>
       <div style="margin-top:4px;color:var(--muted)">"Fetch stations in view" colors every nearby stop by its own delay index</div>
     </div>
     <div id="pearlChain" class="hidden"></div>
@@ -463,7 +460,6 @@ function setBasemap(which) {
 let routeLayer = L.layerGroup().addTo(map);
 let viewportLayer = L.layerGroup().addTo(map);
 let stationMarker = null;
-let stationIndexMarker = null;
 let stationIndexTimer = null;
 let vehicleMarker = null;
 let vehicleTimer = null;
@@ -561,7 +557,11 @@ function renderStationResults(locs) {
 
 // Marks the stop whose departures are currently shown in the sidebar —
 // distinct from the vehicle marker and the H stop icons, so it's clear
-// at a glance which station is "queried" right now.
+// at a glance which station is "queried" right now. Its delay-index
+// breakdown is attached as a click popup (see updateStationIndexPopup)
+// rather than a permanently-floating label, which would otherwise
+// overlap the viewport-overview stations' own permanent labels whenever
+// both are shown at once.
 function highlightStation(loc) {
   clearStationHighlight();
   if (!loc || !loc.crd) return;
@@ -579,7 +579,6 @@ function highlightStation(loc) {
 
 function clearStationHighlight() {
   if (stationMarker) { map.removeLayer(stationMarker); stationMarker = null; }
-  if (stationIndexMarker) { map.removeLayer(stationIndexMarker); stationIndexMarker = null; }
   if (stationIndexTimer) { clearInterval(stationIndexTimer); stationIndexTimer = null; }
 }
 
@@ -610,18 +609,6 @@ function computeStopDelayIndex(jnyL) {
   };
 }
 
-function stopIndexIcon(index) {
-  const text = index.avg === null ? 'no data' : `Ø ${index.avg <= 0 ? '0' : '+' + index.avg.toFixed(1)} min`;
-  const color = index.avg === null ? '#6b7280' : delayColor(index.avg);
-  const cancelledNote = index.cancelledCount ? ` · ${index.cancelledCount} cnl.` : '';
-  return L.divIcon({
-    className: 'stop-index-wrap',
-    html: `<div class="stop-index-badge" style="background:${color}">${text}${cancelledNote}</div>`,
-    iconSize: [130, 20],
-    iconAnchor: [65, 44],
-  });
-}
-
 function stopIndexPopupHtml(loc, index) {
   const avgTxt = index.avg === null ? 'n/a' : `${index.avg <= 0 ? '0' : '+' + index.avg.toFixed(1)} min`;
   const worstTxt = index.worst === null ? 'n/a' : `${index.worst <= 0 ? '0' : '+' + index.worst} min`;
@@ -633,14 +620,15 @@ function stopIndexPopupHtml(loc, index) {
     `cancelled: ${index.cancelledCount} / ${index.total}`;
 }
 
+// Attaches the delay-index breakdown to the station-highlight marker as
+// a click popup, instead of a separate always-visible floating badge
+// (which used to collide with the viewport-overview stations' own
+// permanent labels whenever both were on screen at once). The sidebar's
+// #stopIndexBar chip row already shows the same numbers at a glance.
 function updateStationIndexBadge(loc, jnyL) {
-  if (stationIndexMarker) { map.removeLayer(stationIndexMarker); stationIndexMarker = null; }
-  if (!loc.crd) return;
-  const latlng = [loc.crd.y / 1e6, loc.crd.x / 1e6];
+  if (!stationMarker) return;
   const index = computeStopDelayIndex(jnyL);
-  stationIndexMarker = L.marker(latlng, { icon: stopIndexIcon(index), zIndexOffset: 850 })
-    .bindPopup(stopIndexPopupHtml(loc, index))
-    .addTo(map);
+  stationMarker.bindPopup(stopIndexPopupHtml(loc, index));
 }
 
 // Keeps the index fresh while a stop is being viewed live (lookbackMin
