@@ -1,0 +1,462 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Delaymon — transit delay map</title>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root{
+    --bg:#111417; --panel:#1a1e23; --panel2:#20252b; --text:#e8eaed; --muted:#8b939c;
+    --border:#2a3038; --accent:#4da3ff;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text)}
+  #app{display:flex;height:100vh;width:100vw}
+  #sidebar{width:360px;min-width:300px;max-width:440px;background:var(--panel);border-right:1px solid var(--border);
+    display:flex;flex-direction:column;overflow:hidden}
+  #map{flex:1;background:#0c0e10}
+  .pad{padding:12px 14px}
+  h1{font-size:15px;margin:0 0 10px;font-weight:600;letter-spacing:.2px}
+  h1 small{color:var(--muted);font-weight:400;display:block;font-size:11px;margin-top:2px}
+  #searchBox{position:relative}
+  #searchInput{width:100%;padding:9px 10px;border-radius:8px;border:1px solid var(--border);
+    background:var(--panel2);color:var(--text);font-size:13px;outline:none}
+  #searchInput:focus{border-color:var(--accent)}
+  #searchStatus{font-size:11px;color:var(--muted);margin-top:6px;min-height:14px}
+  .scroll{overflow-y:auto;flex:1}
+  .list-item{padding:9px 14px;border-bottom:1px solid var(--border);cursor:pointer;font-size:13px}
+  .list-item:hover{background:var(--panel2)}
+  .list-item.active{background:#26313f;border-left:3px solid var(--accent);padding-left:11px}
+  .list-item .sub{color:var(--muted);font-size:11px;margin-top:2px}
+  .section-title{padding:10px 14px 4px;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);
+    border-top:1px solid var(--border)}
+  .line-row{display:flex;align-items:center;gap:8px}
+  .line-badge{flex:0 0 auto;min-width:34px;text-align:center;padding:2px 6px;border-radius:5px;font-weight:700;
+    font-size:11px;color:#0b0e10}
+  .line-dir{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .delay-badge{flex:0 0 auto;font-size:11px;font-weight:600;padding:1px 6px;border-radius:10px}
+  .delay-ok{background:#1c3d2a;color:#5fd28a}
+  .delay-mid{background:#453a17;color:#e8c65a}
+  .delay-bad{background:#472020;color:#f07070}
+  .delay-none{background:#262b31;color:var(--muted)}
+  #basemapToggle{display:flex;gap:6px;padding:0 14px 12px}
+  #basemapToggle button{flex:1;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--panel2);
+    color:var(--text);font-size:11px;cursor:pointer}
+  #basemapToggle button.active{background:var(--accent);color:#08131f;border-color:var(--accent);font-weight:600}
+  #legend{position:absolute;bottom:16px;left:376px;background:rgba(20,24,28,.92);border:1px solid var(--border);
+    border-radius:8px;padding:8px 12px;font-size:11px;z-index:500;color:var(--text)}
+  #legend div{display:flex;align-items:center;gap:6px;margin:2px 0}
+  #legend span.swatch{width:14px;height:4px;border-radius:2px;display:inline-block}
+  #error{padding:10px 14px;font-size:12px;background:#3a1f1f;color:#f4a3a3;border-bottom:1px solid var(--border);display:none;
+    white-space:pre-wrap}
+  ::-webkit-scrollbar{width:8px}
+  ::-webkit-scrollbar-thumb{background:#333a42;border-radius:4px}
+  .empty-hint{padding:14px;color:var(--muted);font-size:12px;line-height:1.5}
+  a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="sidebar">
+    <div class="pad">
+      <h1>Delaymon<small>Transit delays per line segment — INSA/LVB (Leipzig)</small></h1>
+      <div id="searchBox">
+        <input id="searchInput" type="text" placeholder="Search stop, e.g. Hauptbahnhof…" autocomplete="off">
+        <div id="searchStatus"></div>
+      </div>
+    </div>
+    <div id="basemapToggle">
+      <button id="btnDark" class="active">Carto Dark</button>
+      <button id="btnLight">Carto Light</button>
+    </div>
+    <div id="error"></div>
+    <div class="scroll" id="resultsPane">
+      <div class="empty-hint">
+        Type a stop name above and pick a result. You'll then see upcoming
+        departures for that stop — click one to draw its route and per-stop
+        delays on the map.
+      </div>
+    </div>
+  </div>
+  <div id="map"></div>
+</div>
+<div id="legend">
+  <div><span class="swatch" style="background:#3fa96a"></span> on time (≤1 min)</div>
+  <div><span class="swatch" style="background:#e8c65a"></span> 2–5 min late</div>
+  <div><span class="swatch" style="background:#e08a3f"></span> 6–10 min late</div>
+  <div><span class="swatch" style="background:#e5484d"></span> &gt;10 min late</div>
+  <div><span class="swatch" style="background:#6b7280"></span> no realtime data</div>
+</div>
+
+<script>
+/* ---------------------------------------------------------------------
+ * HAFAS (mgate.exe) client — INSA / LVB Leipzig
+ *
+ * Endpoint quirks (reverse-engineered from the captured browser request,
+ * not from official docs — adjust AID/endpoint if INSA changes them):
+ *
+ *  - StationBoard  : departures at ONE stop, each with scheduled (xTimeS)
+ *                    vs realtime (xTimeR) time -> delay AT THAT STOP ONLY.
+ *                    No route geometry.
+ *  - JourneyDetails: full stop sequence for one specific run (jid), each
+ *                    stop with its own scheduled/realtime times, plus an
+ *                    encoded polyline for the road/track-following shape.
+ *                    This is what lets us show delay PER SEGMENT, by
+ *                    coloring the leg between consecutive stops using the
+ *                    delay observed at the stop it arrives at.
+ *  - LocMatch      : free-text stop search for the search bar.
+ * ------------------------------------------------------------------- */
+const HAFAS_ENDPOINT = 'https://reiseauskunft.insa.de/bin/mgate.exe';
+const HAFAS_AID = 'kAL6ULet';
+const HAFAS_CLIENT = { id: 'NASA', type: 'WEB', name: 'webapp', l: 'vs_webapp_lvb', v: 10000 };
+
+function reqId() {
+  return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+}
+
+async function hafas(meth, req) {
+  const body = {
+    id: reqId(),
+    ver: '1.48',
+    lang: 'deu',
+    auth: { type: 'AID', aid: HAFAS_AID },
+    client: HAFAS_CLIENT,
+    formatted: false,
+    svcReqL: [{ meth, req, id: '1|1|' }],
+  };
+  const res = await fetch(`${HAFAS_ENDPOINT}?rnd=${Date.now()}`, {
+    method: 'POST',
+    mode: 'cors',
+    credentials: 'omit',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status} from HAFAS endpoint`);
+  const json = await res.json();
+  const svc = json.svcResL && json.svcResL[0];
+  if (!svc) throw new Error('Malformed HAFAS response (no svcResL)');
+  if (svc.err && svc.err !== 'OK') throw new Error(`HAFAS error: ${svc.err} — ${svc.res && svc.res.errTxt || ''}`);
+  return svc.res;
+}
+
+function locMatch(query) {
+  return hafas('LocMatch', {
+    input: { field: 'S', loc: { name: `${query}?`, type: 'ALL' }, maxLoc: 20 },
+  });
+}
+
+function stationBoard(loc) {
+  return hafas('StationBoard', {
+    jnyFltrL: [{ type: 'PROD', mode: 'INC', value: 1023 }],
+    stbLoc: loc,
+    type: 'DEP',
+    sort: 'PT',
+    maxJny: 40,
+  });
+}
+
+function journeyDetails(jid) {
+  return hafas('JourneyDetails', { jid, getPolyline: true });
+}
+
+/* --- time helpers ------------------------------------------------- */
+
+// HAFAS times are "HHMMSS" strings (may exceed 24h for next-day trips).
+function hafasTimeToMinutes(t) {
+  if (!t) return null;
+  const s = t.padStart(6, '0');
+  const h = parseInt(s.slice(0, 2), 10);
+  const m = parseInt(s.slice(2, 4), 10);
+  return h * 60 + m;
+}
+
+function delayMinutes(scheduled, real) {
+  if (!scheduled || !real) return null;
+  let d = hafasTimeToMinutes(real) - hafasTimeToMinutes(scheduled);
+  if (d < -60) d += 1440; // day wraparound
+  return d;
+}
+
+function delayClass(mins) {
+  if (mins === null || mins === undefined) return 'delay-none';
+  if (mins <= 1) return 'delay-ok';
+  if (mins <= 5) return 'delay-mid';
+  return 'delay-bad';
+}
+
+function delayColor(mins) {
+  if (mins === null || mins === undefined) return '#6b7280';
+  if (mins <= 1) return '#3fa96a';
+  if (mins <= 5) return '#e8c65a';
+  if (mins <= 10) return '#e08a3f';
+  return '#e5484d';
+}
+
+function fmtClock(t) {
+  if (!t) return '—';
+  const s = t.padStart(6, '0');
+  return `${s.slice(0, 2)}:${s.slice(2, 4)}`;
+}
+
+// Standard "encoded polyline" decoder (Google algorithm). HAFAS commonly
+// stores it as crdEncYX (lat,lon order) with 1e5 precision; we try both
+// key/order/precision variants defensively since this isn't documented
+// by INSA and could differ per installation.
+function decodePolyline(encoded, precision = 1e5) {
+  let index = 0, lat = 0, lng = 0;
+  const coords = [];
+  while (index < encoded.length) {
+    let result = 0, shift = 0, b;
+    do {
+      b = encoded.charCodeAt(index++) - 63;
+      result |= (b & 0x1f) << shift;
+      shift += 5;
+    } while (b >= 0x20);
+    lat += (result & 1) ? ~(result >> 1) : (result >> 1);
+
+    result = 0; shift = 0;
+    do {
+      b = encoded.charCodeAt(index++) - 63;
+      result |= (b & 0x1f) << shift;
+      shift += 5;
+    } while (b >= 0x20);
+    lng += (result & 1) ? ~(result >> 1) : (result >> 1);
+
+    coords.push([lat / precision, lng / precision]);
+  }
+  return coords;
+}
+
+/* --- map setup ------------------------------------------------------ */
+
+const map = L.map('map', { zoomControl: true }).setView([51.3397, 12.3731], 13); // Leipzig
+
+const cartoDark = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+  maxZoom: 20, attribution: '&copy; OpenStreetMap &copy; CARTO',
+});
+const cartoLight = L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+  maxZoom: 20, attribution: '&copy; OpenStreetMap &copy; CARTO',
+});
+cartoDark.addTo(map);
+
+document.getElementById('btnDark').addEventListener('click', () => setBasemap('dark'));
+document.getElementById('btnLight').addEventListener('click', () => setBasemap('light'));
+function setBasemap(which) {
+  if (which === 'dark') { map.removeLayer(cartoLight); cartoDark.addTo(map); }
+  else { map.removeLayer(cartoDark); cartoLight.addTo(map); }
+  document.getElementById('btnDark').classList.toggle('active', which === 'dark');
+  document.getElementById('btnLight').classList.toggle('active', which === 'light');
+}
+
+let routeLayer = L.layerGroup().addTo(map);
+let stationMarker = null;
+
+/* --- UI plumbing ----------------------------------------------------- */
+
+const searchInput = document.getElementById('searchInput');
+const searchStatus = document.getElementById('searchStatus');
+const resultsPane = document.getElementById('resultsPane');
+const errorBox = document.getElementById('error');
+
+function showError(msg) {
+  errorBox.textContent = msg;
+  errorBox.style.display = 'block';
+}
+function clearError() {
+  errorBox.style.display = 'none';
+  errorBox.textContent = '';
+}
+
+let searchDebounce = null;
+searchInput.addEventListener('input', () => {
+  clearTimeout(searchDebounce);
+  const q = searchInput.value.trim();
+  if (q.length < 2) { searchStatus.textContent = ''; return; }
+  searchStatus.textContent = 'Searching…';
+  searchDebounce = setTimeout(() => runSearch(q), 350);
+});
+
+async function runSearch(q) {
+  clearError();
+  try {
+    const res = await locMatch(q);
+    const locs = (res.match && res.match.locL) || [];
+    searchStatus.textContent = `${locs.length} result(s)`;
+    renderStationResults(locs);
+  } catch (e) {
+    searchStatus.textContent = '';
+    handleFetchError(e);
+  }
+}
+
+function handleFetchError(e) {
+  const corsHint = (e instanceof TypeError)
+    ? '\n\nThis usually means the browser blocked the cross-origin request (CORS). ' +
+      'The INSA endpoint may only allow requests from its own site. If this ' +
+      'keeps happening, this page needs a small same-origin proxy in front of ' +
+      'reiseauskunft.insa.de.'
+    : '';
+  showError(`Request failed: ${e.message}${corsHint}`);
+  console.error(e);
+}
+
+function renderStationResults(locs) {
+  resultsPane.innerHTML = '';
+  if (!locs.length) {
+    resultsPane.innerHTML = '<div class="empty-hint">No stops found.</div>';
+    return;
+  }
+  const title = document.createElement('div');
+  title.className = 'section-title';
+  title.textContent = 'Stops';
+  resultsPane.appendChild(title);
+
+  locs.forEach(loc => {
+    const item = document.createElement('div');
+    item.className = 'list-item';
+    item.innerHTML = `<div>${loc.name}</div>`;
+    item.addEventListener('click', () => selectStation(loc, item));
+    resultsPane.appendChild(item);
+  });
+}
+
+async function selectStation(loc, itemEl) {
+  document.querySelectorAll('#resultsPane .list-item').forEach(el => el.classList.remove('active'));
+  if (itemEl) itemEl.classList.add('active');
+  clearError();
+  routeLayer.clearLayers();
+
+  if (loc.crd) {
+    const latlng = [loc.crd.y / 1e6, loc.crd.x / 1e6];
+    map.setView(latlng, 15);
+    if (stationMarker) map.removeLayer(stationMarker);
+    stationMarker = L.circleMarker(latlng, { radius: 6, color: '#4da3ff', weight: 2, fillOpacity: .8 }).addTo(map);
+  }
+
+  resultsPane.innerHTML = '<div class="empty-hint">Loading departures…</div>';
+  try {
+    const res = await stationBoard({ name: loc.name, lid: loc.lid });
+    renderDepartures(res, loc);
+  } catch (e) {
+    resultsPane.innerHTML = '';
+    handleFetchError(e);
+  }
+}
+
+function renderDepartures(res, stationLoc) {
+  const prodL = (res.common && res.common.prodL) || [];
+  const jnyL = res.jnyL || [];
+  resultsPane.innerHTML = '';
+
+  const back = document.createElement('div');
+  back.className = 'list-item';
+  back.style.color = 'var(--accent)';
+  back.textContent = '← back to search';
+  back.addEventListener('click', () => {
+    resultsPane.innerHTML = '<div class="empty-hint">Type a stop name above to search again.</div>';
+  });
+  resultsPane.appendChild(back);
+
+  const title = document.createElement('div');
+  title.className = 'section-title';
+  title.textContent = `Departures — ${stationLoc.name}`;
+  resultsPane.appendChild(title);
+
+  if (!jnyL.length) {
+    const empty = document.createElement('div');
+    empty.className = 'empty-hint';
+    empty.textContent = 'No upcoming departures returned for this stop.';
+    resultsPane.appendChild(empty);
+    return;
+  }
+
+  jnyL.forEach(jny => {
+    const prod = prodL[jny.prodX] || {};
+    const stop = jny.stbStop || {};
+    const mins = delayMinutes(stop.dTimeS, stop.dTimeR);
+    const item = document.createElement('div');
+    item.className = 'list-item';
+    item.innerHTML = `
+      <div class="line-row">
+        <span class="line-badge" style="background:${delayColor(mins)}">${prod.name || '?'}</span>
+        <span class="line-dir">${jny.dirTxt || ''}</span>
+      </div>
+      <div class="sub">${fmtClock(stop.dTimeS)}${mins !== null ? ` → ${fmtClock(stop.dTimeR)}` : ''}
+        <span class="delay-badge ${delayClass(mins)}" style="margin-left:6px">
+          ${mins === null ? 'scheduled' : (mins <= 0 ? 'on time' : `+${mins} min`)}
+        </span>
+      </div>`;
+    item.addEventListener('click', () => selectJourney(jny, item));
+    resultsPane.appendChild(item);
+  });
+}
+
+async function selectJourney(jny, itemEl) {
+  document.querySelectorAll('#resultsPane .list-item').forEach(el => el.classList.remove('active'));
+  if (itemEl) itemEl.classList.add('active');
+  clearError();
+  routeLayer.clearLayers();
+  try {
+    const res = await journeyDetails(jny.jid);
+    drawJourney(res);
+  } catch (e) {
+    handleFetchError(e);
+  }
+}
+
+function drawJourney(res) {
+  const locL = (res.common && res.common.locL) || [];
+  const polyL = (res.common && res.common.polyL) || [];
+  const journey = res.journey || res; // some installs put stopL at top level
+  const stopL = journey.stopL || [];
+
+  // Base route shape from the encoded polyline, if present — drawn as a
+  // thin neutral guide line under the delay-colored stop-to-stop segments.
+  const polyIdx = journey.polyG && journey.polyG.polyXL && journey.polyG.polyXL[0];
+  if (polyL.length && polyIdx !== undefined && polyL[polyIdx]) {
+    const raw = polyL[polyIdx].crdEncYX || polyL[polyIdx].crdEncXY;
+    if (raw) {
+      let coords = decodePolyline(raw);
+      if (polyL[polyIdx].crdEncXY) coords = coords.map(([a, b]) => [b, a]); // XY -> lat,lng
+      L.polyline(coords, { color: '#5b6572', weight: 3, opacity: .55 }).addTo(routeLayer);
+    }
+  }
+
+  // Per-stop markers + delay-colored segments between consecutive stops.
+  const points = [];
+  stopL.forEach(stop => {
+    const loc = locL[stop.locX];
+    if (!loc || !loc.crd) return;
+    const latlng = [loc.crd.y / 1e6, loc.crd.x / 1e6];
+    const arrDelay = delayMinutes(stop.aTimeS, stop.aTimeR);
+    const depDelay = delayMinutes(stop.dTimeS, stop.dTimeR);
+    const delay = arrDelay !== null ? arrDelay : depDelay;
+    points.push({ latlng, delay, name: loc.name, stop });
+
+    L.circleMarker(latlng, {
+      radius: 5, color: delayColor(delay), weight: 2, fillColor: delayColor(delay), fillOpacity: .9,
+    }).bindTooltip(
+      `<b>${loc.name}</b><br>arr ${fmtClock(stop.aTimeS)}${arrDelay !== null ? ` (${arrDelay <= 0 ? 'on time' : '+' + arrDelay + ' min'})` : ''}` +
+      `<br>dep ${fmtClock(stop.dTimeS)}${depDelay !== null ? ` (${depDelay <= 0 ? 'on time' : '+' + depDelay + ' min'})` : ''}`,
+      { direction: 'top' }
+    ).addTo(routeLayer);
+  });
+
+  for (let i = 0; i < points.length - 1; i++) {
+    const a = points[i], b = points[i + 1];
+    const segDelay = b.delay !== null ? b.delay : a.delay;
+    L.polyline([a.latlng, b.latlng], {
+      color: delayColor(segDelay), weight: 6, opacity: .9,
+    }).addTo(routeLayer);
+  }
+
+  if (points.length) {
+    const bounds = L.latLngBounds(points.map(p => p.latlng));
+    map.fitBounds(bounds, { padding: [40, 40] });
+  }
+}
+</script>
+</body>
+</html>
