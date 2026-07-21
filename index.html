@@ -53,6 +53,10 @@
   .delay-mid{background:#453a17;color:#e8c65a}
   .delay-bad{background:#472020;color:#f07070}
   .delay-none{background:#262b31;color:var(--muted)}
+  .delay-cancelled{background:#7a2323;color:#ffb4b4}
+  .remark-note{font-size:10px;color:var(--muted);font-style:italic;margin-top:3px;line-height:1.4}
+  .h-marker-cancelled .h-marker{background:#1a0f0f}
+  .vehicle-marker-live{box-shadow:0 0 0 3px rgba(63,169,106,.55)}
   #basemapToggle{display:flex;gap:6px;padding:0 14px 12px}
   #basemapToggle button{flex:1;padding:6px 8px;border-radius:6px;border:1px solid var(--border);background:var(--panel2);
     color:var(--text);font-size:11px;cursor:pointer}
@@ -119,8 +123,9 @@
   <div><span class="swatch" style="background:#e5484d"></span> &gt;10 min late</div>
   <div><span class="swatch" style="background:#6b7280"></span> no realtime data</div>
   <div style="margin-top:4px;color:var(--muted)">Click a stop's <b>H</b> marker for its other lines</div>
-  <div style="margin-top:4px;color:var(--muted)">Pulsing dot = approximate vehicle position (interpolated, not GPS)</div>
+  <div style="margin-top:4px;color:var(--muted)">Pulsing dot = vehicle position (live GPS if the operator reports it, otherwise interpolated)</div>
   <div style="margin-top:4px;color:var(--muted)">Use "Show from" in a stop's list to see past/departed trips</div>
+  <div style="margin-top:4px;color:var(--muted)"><span class="swatch" style="background:#7a2323"></span> cancelled stop/segment</div>
 </div>
 
 <script>
@@ -248,6 +253,49 @@ function fmtClock(t) {
   if (!t) return '—';
   const s = t.padStart(6, '0');
   return `${s.slice(0, 2)}:${s.slice(2, 4)}`;
+}
+
+const CANCEL_COLOR = '#7a2323';
+
+// A stop is cancelled if either its arrival or departure there is
+// cancelled (aCncl/dCncl) — distinct from just "no realtime data yet",
+// which we were previously conflating into the same grey state.
+function stopCancelled(stop) {
+  return !!(stop && (stop.aCncl || stop.dCncl));
+}
+
+// "Pass-by" stops (dInS/aOutS both false) are timing points the vehicle
+// runs through without actually stopping — not a real boarding stop, so
+// we skip drawing an H marker there, though it still counts for the
+// route geometry/segments.
+function stopIsPassBy(stop) {
+  return !!(stop && stop.dInS === false && stop.aOutS === false);
+}
+
+// HAFAS ties free-text disruption reasons to a stop/journey indirectly:
+// a `msgL` array of {type:'REM'|'HIM', remX|himX} references, resolved
+// against common.remL (hints) / common.himL (warnings). The actual text
+// field name isn't confirmed for this INSA install (varies: txt/text/
+// head across HAFAS deployments), so we check all of them defensively —
+// if none match, we just show nothing rather than erroring.
+function extractRemarkText(entry) {
+  if (!entry) return null;
+  return entry.txt || entry.text || entry.head || entry.jtxt || null;
+}
+
+function resolveRemarks(common, msgL) {
+  if (!Array.isArray(msgL) || !msgL.length) return [];
+  const remL = (common && common.remL) || [];
+  const himL = (common && common.himL) || [];
+  const texts = [];
+  msgL.forEach(ref => {
+    let entry = null;
+    if (ref.type === 'REM' && ref.remX !== undefined) entry = remL[ref.remX];
+    else if (ref.type === 'HIM' && ref.himX !== undefined) entry = himL[ref.himX];
+    const text = extractRemarkText(entry);
+    if (text && !texts.includes(text)) texts.push(text);
+  });
+  return texts;
 }
 
 function pad2(n) { return String(n).padStart(2, '0'); }
@@ -501,22 +549,25 @@ function renderDepartures(res, stationLoc, lookbackMin = 0) {
   jnyL.forEach(jny => {
     const prod = prodL[jny.prodX] || {};
     const stop = jny.stbStop || {};
+    const cancelled = stopCancelled(stop);
     const mins = delayMinutes(stop.dTimeS, stop.dTimeR);
     const stopMin = hafasTimeToMinutes(stop.dTimeR || stop.dTimeS);
     const isDeparted = lookbackMin > 0 && stopMin !== null && nowMin !== null && stopMin < nowMin;
+    const remarks = resolveRemarks(res.common, jny.msgL || stop.msgL);
     const item = document.createElement('div');
     item.className = 'list-item' + (isDeparted ? ' departed' : '');
     item.innerHTML = `
       <div class="line-row">
-        <span class="line-badge" style="background:${delayColor(mins)}">${prod.name || '?'}</span>
+        <span class="line-badge" style="background:${cancelled ? CANCEL_COLOR : delayColor(mins)}">${prod.name || '?'}</span>
         <span class="line-dir">${jny.dirTxt || ''}</span>
         ${isDeparted ? '<span class="delay-badge departed-tag">departed</span>' : ''}
       </div>
-      <div class="sub">${fmtClock(stop.dTimeS)}${mins !== null ? ` → ${fmtClock(stop.dTimeR)}` : ''}
-        <span class="delay-badge ${delayClass(mins)}" style="margin-left:6px">
-          ${mins === null ? 'scheduled' : (mins <= 0 ? 'on time' : `+${mins} min`)}
+      <div class="sub">${fmtClock(stop.dTimeS)}${!cancelled && mins !== null ? ` → ${fmtClock(stop.dTimeR)}` : ''}
+        <span class="delay-badge ${cancelled ? 'delay-cancelled' : delayClass(mins)}" style="margin-left:6px">
+          ${cancelled ? 'cancelled' : (mins === null ? 'scheduled' : (mins <= 0 ? 'on time' : `+${mins} min`))}
         </span>
-      </div>`;
+      </div>
+      ${remarks.length ? `<div class="remark-note">${remarks.join(' · ')}</div>` : ''}`;
     item.addEventListener('click', () => selectJourney(jny, item));
     resultsPane.appendChild(item);
   });
@@ -530,25 +581,25 @@ async function selectJourney(jny, itemEl) {
   stopVehicleTracking();
   try {
     const res = await journeyDetails(jny.jid);
-    drawJourney(res);
+    drawJourney(res, jny.jid);
   } catch (e) {
     handleFetchError(e);
   }
 }
 
-function vehicleIcon(color) {
+function vehicleIcon(color, isLive) {
   return L.divIcon({
     className: 'vehicle-marker-wrap',
-    html: `<div class="vehicle-marker" style="background:${color}"></div>`,
+    html: `<div class="vehicle-marker${isLive ? ' vehicle-marker-live' : ''}" style="background:${color}"></div>`,
     iconSize: [16, 16],
     iconAnchor: [8, 8],
   });
 }
 
-function hIcon(color) {
+function hIcon(color, cancelled) {
   return L.divIcon({
-    className: 'h-marker-wrap',
-    html: `<div class="h-marker" style="border-color:${color};color:${color}">H</div>`,
+    className: 'h-marker-wrap' + (cancelled ? ' h-marker-cancelled' : ''),
+    html: `<div class="h-marker" style="border-color:${color};color:${color}">${cancelled ? '✕' : 'H'}</div>`,
     iconSize: [22, 22],
     iconAnchor: [11, 11],
   });
@@ -561,6 +612,15 @@ function delayLabelIcon(minutes) {
     html: `<div class="delay-label" style="background:${delayColor(minutes)}">${text} min</div>`,
     iconSize: [44, 16],
     iconAnchor: [22, 8],
+  });
+}
+
+function cancelledLabelIcon() {
+  return L.divIcon({
+    className: 'delay-label-wrap',
+    html: `<div class="delay-label" style="background:${CANCEL_COLOR};color:#ffb4b4">cancelled</div>`,
+    iconSize: [64, 16],
+    iconAnchor: [32, 8],
   });
 }
 
@@ -691,7 +751,7 @@ function computeVehiclePosition(points, segCoordsList) {
   return null; // before start or after the last stop
 }
 
-function drawJourney(res) {
+function drawJourney(res, jid) {
   const locL = (res.common && res.common.locL) || [];
   const polyL = (res.common && res.common.polyL) || [];
   const journey = res.journey || res; // some installs put stopL at top level
@@ -710,7 +770,7 @@ function drawJourney(res) {
     }
   }
 
-  // Per-stop points, each carrying its own delay.
+  // Per-stop points, each carrying its own delay/cancellation/remarks.
   const points = [];
   stopL.forEach(stop => {
     const loc = locL[stop.locX];
@@ -719,18 +779,23 @@ function drawJourney(res) {
     const arrDelay = delayMinutes(stop.aTimeS, stop.aTimeR);
     const depDelay = delayMinutes(stop.dTimeS, stop.dTimeR);
     const delay = arrDelay !== null ? arrDelay : depDelay;
-    points.push({ latlng, delay, arrDelay, depDelay, loc, stop });
+    const cancelled = stopCancelled(stop);
+    const passBy = stopIsPassBy(stop);
+    const remarks = resolveRemarks(res.common, stop.msgL);
+    points.push({ latlng, delay, arrDelay, depDelay, cancelled, passBy, remarks, loc, stop });
   });
 
   const matchIdxs = matchStopsToPolyline(routeCoords, points);
 
   // Delay-colored segments, snapped to the real route geometry between
-  // each pair of consecutive stops, with a "+N min" label at the midpoint.
+  // each pair of consecutive stops, with a "+N min" label at the midpoint
+  // (or a "cancelled" label/dashing if either endpoint is cancelled).
   // segCoordsList is kept around so the vehicle interpolation below walks
   // the same geometry the coloring uses.
   const segCoordsList = [];
   for (let i = 0; i < points.length - 1; i++) {
     const a = points[i], b = points[i + 1];
+    const segCancelled = a.cancelled || b.cancelled;
     const segDelay = b.delay !== null ? b.delay : a.delay;
     let segCoords;
     if (matchIdxs && matchIdxs[i + 1] > matchIdxs[i]) {
@@ -739,20 +804,30 @@ function drawJourney(res) {
       segCoords = [a.latlng, b.latlng];
     }
     segCoordsList.push(segCoords);
-    L.polyline(segCoords, { color: delayColor(segDelay), weight: 6, opacity: .9 }).addTo(routeLayer);
+    const segStyle = segCancelled
+      ? { color: CANCEL_COLOR, weight: 6, opacity: .9, dashArray: '6,6' }
+      : { color: delayColor(segDelay), weight: 6, opacity: .9 };
+    L.polyline(segCoords, segStyle).addTo(routeLayer);
 
     const mid = midpointByLength(segCoords);
-    L.marker(mid, { icon: delayLabelIcon(segDelay), interactive: false }).addTo(routeLayer);
+    const labelIcon = segCancelled ? cancelledLabelIcon() : delayLabelIcon(segDelay);
+    L.marker(mid, { icon: labelIcon, interactive: false }).addTo(routeLayer);
   }
 
-  // Stop markers: a colored circled "H", clickable to browse that stop's
-  // other departures without losing the drawn route.
+  // Stop markers: a colored circled "H" (or "✕" if cancelled), clickable
+  // to browse that stop's other departures without losing the drawn
+  // route. Pass-by timing points (vehicle doesn't actually stop) are
+  // skipped to avoid cluttering the map with non-boarding markers.
   points.forEach(p => {
-    const { loc, stop, arrDelay, depDelay, delay } = p;
-    const marker = L.marker(p.latlng, { icon: hIcon(delayColor(delay)) }).bindTooltip(
-      `<b>${loc.name}</b><br>arr ${fmtClock(stop.aTimeS)}${arrDelay !== null ? ` (${arrDelay <= 0 ? 'on time' : '+' + arrDelay + ' min'})` : ''}` +
-      `<br>dep ${fmtClock(stop.dTimeS)}${depDelay !== null ? ` (${depDelay <= 0 ? 'on time' : '+' + depDelay + ' min'})` : ''}` +
-      `<br><i>click for more lines at this stop</i>`,
+    if (p.passBy) return;
+    const { loc, stop, arrDelay, depDelay, delay, cancelled, remarks } = p;
+    const tooltip = cancelled
+      ? `<b>${loc.name}</b><br><b>CANCELLED</b>`
+      : `<b>${loc.name}</b><br>arr ${fmtClock(stop.aTimeS)}${arrDelay !== null ? ` (${arrDelay <= 0 ? 'on time' : '+' + arrDelay + ' min'})` : ''}` +
+        `<br>dep ${fmtClock(stop.dTimeS)}${depDelay !== null ? ` (${depDelay <= 0 ? 'on time' : '+' + depDelay + ' min'})` : ''}`;
+    const remarkHtml = remarks.length ? `<br><i>${remarks.join('; ')}</i>` : '';
+    const marker = L.marker(p.latlng, { icon: hIcon(cancelled ? CANCEL_COLOR : delayColor(delay), cancelled) }).bindTooltip(
+      `${tooltip}${remarkHtml}<br><i>click for more lines at this stop</i>`,
       { direction: 'top' }
     );
     marker.on('click', () => showStationBoardFor({ name: loc.name, lid: loc.lid }));
@@ -764,25 +839,48 @@ function drawJourney(res) {
     map.fitBounds(bounds, { padding: [40, 40] });
   }
 
-  startVehicleTracking(points, segCoordsList);
+  startVehicleTracking(jid, points, segCoordsList, journey);
 }
 
-// Ticks the interpolated vehicle position forward every 2s and glides the
-// marker to it. Not live GPS — see computeVehiclePosition's comment — but
-// a smoothly-updating best guess of where the vehicle is right now, given
-// schedule + delay.
+const LIVE_GPS_TOOLTIP = 'live GPS position (reported by vehicle)';
+const INTERPOLATED_TOOLTIP = 'approximate position (interpolated from timetable + delay, not live GPS)';
+
+function journeyLatLng(journey) {
+  if (!journey || !journey.pos) return null;
+  return [journey.pos.y / 1e6, journey.pos.x / 1e6];
+}
+
+function latestKnownDelay(points) {
+  for (let i = points.length - 1; i >= 0; i--) {
+    if (points[i].delay !== null) return points[i].delay;
+  }
+  return null;
+}
+
+// Drives the vehicle marker two different ways, in priority order:
 //
-// The glide is done by hand with requestAnimationFrame rather than a CSS
-// transition on the marker's transform: Leaflet also rewrites that same
-// transform on every zoom/pan frame to keep the marker glued to its
-// lat/lng, and a CSS transition fights that rewrite, producing a visible
-// lag/drift while zooming. Driving position purely through setLatLng here
-// avoids the conflict — Leaflet repositions instantly and correctly on
-// zoom no matter where we are mid-glide.
-function startVehicleTracking(points, segCoordsList) {
+// 1) Live GPS: some HAFAS installs put an actual reported position on the
+//    journey object (raw field `pos`, {x,y} in the same WGS84*1e6 encoding
+//    as everything else) — see hafas-client's parse/journey-leg.js, which
+//    surfaces this as `currentLocation`. If it's present we re-fetch
+//    JourneyDetails periodically and just plot that position directly —
+//    ground truth, no guessing.
+// 2) Schedule interpolation (computeVehiclePosition): our fallback when
+//    no live position field is present, ticking locally every 2s with no
+//    extra network calls.
+//
+// The glide between updates is done by hand with requestAnimationFrame
+// rather than a CSS transition on the marker's transform: Leaflet also
+// rewrites that same transform on every zoom/pan frame to keep the marker
+// glued to its lat/lng, and a CSS transition fights that rewrite,
+// producing a visible lag/drift while zooming. Driving position purely
+// through setLatLng here avoids the conflict.
+function startVehicleTracking(jid, points, segCoordsList, initialJourney) {
   stopVehicleTracking();
   const TICK_MS = 2000;
+  const LIVE_POLL_MS = 15000;
   let displayLatLng = null;
+  let useLiveGps = !!journeyLatLng(initialJourney);
 
   function animate(target) {
     if (vehicleAnimHandle) cancelAnimationFrame(vehicleAnimHandle);
@@ -799,25 +897,56 @@ function startVehicleTracking(points, segCoordsList) {
     vehicleAnimHandle = requestAnimationFrame(step);
   }
 
-  const tick = () => {
-    const pos = computeVehiclePosition(points, segCoordsList);
-    if (!pos) {
+  function applyPosition(latlng, delay, isLive) {
+    if (!latlng) {
       if (vehicleMarker) { routeLayer.removeLayer(vehicleMarker); vehicleMarker = null; }
       displayLatLng = null;
       return;
     }
+    const tooltipText = isLive ? LIVE_GPS_TOOLTIP : INTERPOLATED_TOOLTIP;
     if (!vehicleMarker) {
-      vehicleMarker = L.marker(pos.latlng, { icon: vehicleIcon(delayColor(pos.delay)), zIndexOffset: 1000 })
-        .bindTooltip('approximate position (interpolated from timetable + delay, not live GPS)', { direction: 'top' })
+      vehicleMarker = L.marker(latlng, { icon: vehicleIcon(delayColor(delay), isLive), zIndexOffset: 1000 })
+        .bindTooltip(tooltipText, { direction: 'top' })
         .addTo(routeLayer);
-      displayLatLng = pos.latlng;
+      displayLatLng = latlng;
     } else {
-      vehicleMarker.setIcon(vehicleIcon(delayColor(pos.delay)));
-      animate(pos.latlng);
+      vehicleMarker.setIcon(vehicleIcon(delayColor(delay), isLive));
+      vehicleMarker.setTooltipContent(tooltipText);
+      animate(latlng);
     }
-  };
-  tick();
-  vehicleTimer = setInterval(tick, TICK_MS);
+  }
+
+  function tickInterpolated() {
+    const pos = computeVehiclePosition(points, segCoordsList);
+    applyPosition(pos && pos.latlng, pos && pos.delay, false);
+  }
+
+  async function pollLiveGps() {
+    try {
+      const res = await journeyDetails(jid);
+      const journey = res.journey || res;
+      const latlng = journeyLatLng(journey);
+      if (latlng) {
+        applyPosition(latlng, latestKnownDelay(points), true);
+        return;
+      }
+    } catch (e) {
+      return; // transient failure — keep last known position, retry next poll
+    }
+    // Position field disappeared (e.g. trip ended) — fall back permanently.
+    useLiveGps = false;
+    clearInterval(vehicleTimer);
+    tickInterpolated();
+    vehicleTimer = setInterval(tickInterpolated, TICK_MS);
+  }
+
+  if (useLiveGps) {
+    applyPosition(journeyLatLng(initialJourney), latestKnownDelay(points), true);
+    vehicleTimer = setInterval(pollLiveGps, LIVE_POLL_MS);
+  } else {
+    tickInterpolated();
+    vehicleTimer = setInterval(tickInterpolated, TICK_MS);
+  }
 }
 </script>
 </body>
