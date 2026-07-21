@@ -31,6 +31,12 @@
   #lookbackRow label{font-size:11px;color:var(--muted)}
   #lookbackSelect{flex:1;padding:5px 6px;border-radius:6px;border:1px solid var(--border);background:var(--panel2);
     color:var(--text);font-size:12px}
+  #stopIndexBar{display:flex;flex-wrap:wrap;gap:6px;padding:8px 14px;border-bottom:1px solid var(--border)}
+  .stop-index-chip{padding:2px 8px;border-radius:10px;background:var(--panel2);color:var(--text);font-size:11px}
+  .stop-index-chip.accent{font-weight:700}
+  .stop-index-wrap{background:transparent;border:none}
+  .stop-index-badge{padding:3px 8px;border-radius:10px;font-size:11px;font-weight:700;color:#0b0e10;
+    white-space:nowrap;box-shadow:0 2px 6px rgba(0,0,0,.5);text-align:center;cursor:pointer;font-family:sans-serif}
   .list-item.departed{opacity:.55}
   .departed-tag{background:#262b31;color:var(--muted)}
   #searchBox{position:relative}
@@ -162,6 +168,7 @@
       <div style="margin-top:4px;color:var(--muted)">Click a stop's <b>H</b> marker for its other lines</div>
       <div style="margin-top:4px;color:var(--muted)">Pulsing dot = vehicle position (live GPS if reported, else interpolated)</div>
       <div style="margin-top:4px;color:var(--muted)">Use "Show from" in a stop's list to see past/departed trips</div>
+      <div style="margin-top:4px;color:var(--muted)">"Ø +N min" badge = live delay index for the queried stop — click for details</div>
     </div>
     <div id="pearlChain" class="hidden"></div>
   </div>
@@ -411,6 +418,8 @@ function setBasemap(which) {
 
 let routeLayer = L.layerGroup().addTo(map);
 let stationMarker = null;
+let stationIndexMarker = null;
+let stationIndexTimer = null;
 let vehicleMarker = null;
 let vehicleTimer = null;
 let vehicleAnimHandle = null;
@@ -509,7 +518,7 @@ function renderStationResults(locs) {
 // distinct from the vehicle marker and the H stop icons, so it's clear
 // at a glance which station is "queried" right now.
 function highlightStation(loc) {
-  if (stationMarker) { map.removeLayer(stationMarker); stationMarker = null; }
+  clearStationHighlight();
   if (!loc || !loc.crd) return;
   const latlng = [loc.crd.y / 1e6, loc.crd.x / 1e6];
   stationMarker = L.marker(latlng, {
@@ -521,6 +530,93 @@ function highlightStation(loc) {
     }),
     zIndexOffset: 800,
   }).bindTooltip(`<b>${loc.name}</b> (queried stop)`, { direction: 'top' }).addTo(map);
+}
+
+function clearStationHighlight() {
+  if (stationMarker) { map.removeLayer(stationMarker); stationMarker = null; }
+  if (stationIndexMarker) { map.removeLayer(stationIndexMarker); stationIndexMarker = null; }
+  if (stationIndexTimer) { clearInterval(stationIndexTimer); stationIndexTimer = null; }
+}
+
+// A live "delay index" for a stop, computed from whatever StationBoard
+// currently returns for it — no invented composite score, just the plain
+// stats: mean delay across departures with known realtime info, the
+// worst one, how many are on-time, how many are outright cancelled. This
+// is the aggregate view HAFAS itself never gives you (StationBoard only
+// tells you about one line at a time) — computed client-side from the
+// same board data already being fetched for the sidebar list.
+function computeStopDelayIndex(jnyL) {
+  let sum = 0, count = 0, worst = null, cancelledCount = 0, onTimeCount = 0;
+  const total = jnyL.length;
+  jnyL.forEach(jny => {
+    const stop = jny.stbStop || {};
+    if (stopCancelled(stop)) { cancelledCount++; return; }
+    const mins = delayMinutes(stop.dTimeS, stop.dTimeR);
+    if (mins === null) return;
+    sum += mins;
+    count++;
+    if (mins <= 1) onTimeCount++;
+    if (worst === null || mins > worst) worst = mins;
+  });
+  return {
+    avg: count ? sum / count : null,
+    count, total, worst, cancelledCount,
+    pctOnTime: count ? Math.round((onTimeCount / count) * 100) : null,
+  };
+}
+
+function stopIndexIcon(index) {
+  const text = index.avg === null ? 'no data' : `Ø ${index.avg <= 0 ? '0' : '+' + index.avg.toFixed(1)} min`;
+  const color = index.avg === null ? '#6b7280' : delayColor(index.avg);
+  const cancelledNote = index.cancelledCount ? ` · ${index.cancelledCount} cnl.` : '';
+  return L.divIcon({
+    className: 'stop-index-wrap',
+    html: `<div class="stop-index-badge" style="background:${color}">${text}${cancelledNote}</div>`,
+    iconSize: [130, 20],
+    iconAnchor: [65, 44],
+  });
+}
+
+function stopIndexPopupHtml(loc, index) {
+  const avgTxt = index.avg === null ? 'n/a' : `${index.avg <= 0 ? '0' : '+' + index.avg.toFixed(1)} min`;
+  const worstTxt = index.worst === null ? 'n/a' : `${index.worst <= 0 ? '0' : '+' + index.worst} min`;
+  return `<b>${loc.name}</b> — live delay index<br>` +
+    `based on the next ${index.total} departure(s) currently listed<br>` +
+    `average delay: <b>${avgTxt}</b><br>` +
+    `worst delay: ${worstTxt}<br>` +
+    `on-time (≤1 min): ${index.pctOnTime === null ? 'n/a' : index.pctOnTime + '%'}<br>` +
+    `cancelled: ${index.cancelledCount} / ${index.total}`;
+}
+
+function updateStationIndexBadge(loc, jnyL) {
+  if (stationIndexMarker) { map.removeLayer(stationIndexMarker); stationIndexMarker = null; }
+  if (!loc.crd) return;
+  const latlng = [loc.crd.y / 1e6, loc.crd.x / 1e6];
+  const index = computeStopDelayIndex(jnyL);
+  stationIndexMarker = L.marker(latlng, { icon: stopIndexIcon(index), zIndexOffset: 850 })
+    .bindPopup(stopIndexPopupHtml(loc, index))
+    .addTo(map);
+}
+
+// Keeps the index fresh while a stop is being viewed live (lookbackMin
+// === 0): re-fetches StationBoard every 45s and re-renders both the map
+// badge and the sidebar list. Guards against races (station/lookback
+// changed mid-flight) by re-checking current state before applying.
+function startStopIndexPolling(loc) {
+  if (stationIndexTimer) clearInterval(stationIndexTimer);
+  stationIndexTimer = setInterval(async () => {
+    if (!currentStationLoc || currentStationLoc.lid !== loc.lid || currentLookbackMin !== 0) return;
+    try {
+      const res = await stationBoard({ name: loc.name, lid: loc.lid });
+      if (!currentStationLoc || currentStationLoc.lid !== loc.lid || currentLookbackMin !== 0) return;
+      dataAsOf = new Date();
+      tickClock();
+      renderDepartures(res, loc, 0);
+      updateStationIndexBadge(loc, res.jnyL || []);
+    } catch (e) {
+      // transient failure — keep showing the last known index/list
+    }
+  }, 45000);
 }
 
 async function selectStation(loc, itemEl) {
@@ -561,6 +657,8 @@ async function showStationBoardFor(loc, lookbackMin = 0) {
     tickClock();
     const res = await stationBoard({ name: loc.name, lid: loc.lid }, lookbackMin > 0 ? refDate : null);
     renderDepartures(res, loc, lookbackMin);
+    updateStationIndexBadge(loc, res.jnyL || []);
+    if (lookbackMin === 0) startStopIndexPolling(loc);
   } catch (e) {
     resultsPane.innerHTML = '';
     handleFetchError(e);
@@ -578,6 +676,7 @@ function renderDepartures(res, stationLoc, lookbackMin = 0) {
   back.textContent = '← back to search';
   back.addEventListener('click', () => {
     currentStationLoc = null;
+    clearStationHighlight();
     resultsPane.innerHTML = '<div class="empty-hint">Type a stop name above to search again.</div>';
   });
   resultsPane.appendChild(back);
@@ -612,6 +711,20 @@ function renderDepartures(res, stationLoc, lookbackMin = 0) {
     resultsPane.appendChild(empty);
     return;
   }
+
+  const index = computeStopDelayIndex(jnyL);
+  const indexBar = document.createElement('div');
+  indexBar.id = 'stopIndexBar';
+  const avgColor = index.avg === null ? '#6b7280' : delayColor(index.avg);
+  indexBar.innerHTML = `
+    <span class="stop-index-chip accent" style="background:${avgColor};color:#0b0e10">
+      Ø ${index.avg === null ? 'n/a' : (index.avg <= 0 ? '0' : '+' + index.avg.toFixed(1)) + ' min'}
+    </span>
+    <span class="stop-index-chip">worst ${index.worst === null ? 'n/a' : (index.worst <= 0 ? '0' : '+' + index.worst) + ' min'}</span>
+    <span class="stop-index-chip">on-time ${index.pctOnTime === null ? 'n/a' : index.pctOnTime + '%'}</span>
+    ${index.cancelledCount ? `<span class="stop-index-chip" style="background:${CANCEL_COLOR};color:#ffb4b4">${index.cancelledCount} cancelled</span>` : ''}
+    <span class="stop-index-chip" style="color:var(--muted)">(next ${index.total})</span>`;
+  resultsPane.appendChild(indexBar);
 
   const nowMin = hafasTimeToMinutes(hafasTimeString(new Date()));
   jnyL.forEach(jny => {
